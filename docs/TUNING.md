@@ -106,6 +106,76 @@ Costs ~2 GiB of host RAM per card.
 The 52 ms figure is the one users feel: a repeat prompt costs essentially nothing. The disk tier
 is what carries that across a process restart, where an in-process cache cannot.
 
+### `--ple-io mmap` — the RAM-side lever, and why not `ram`
+
+The 28.8 GiB shard 2 is the n-gram/PLE table, read once per token. `--ple-io` decides how that
+read happens, and it turned out to be the only memory-side setting with room left on this
+configuration:
+
+| `--ple-io` | Prose | Code | `VmLck` | `VmSwap` | `MemAvailable` |
+| --- | --: | --: | --: | --: | --: |
+| `direct` (engine default) | 73.0 | 72.6 | 0 | 0 | high |
+| `ram` | 75.8 | 98.8 | **26.8 GiB** | 0.95 GiB | 34.5 GiB |
+| **`mmap`** | **74.1** | **100.0** | **0** | **0** | **59.5–64 GiB** |
+
+`direct` does unbuffered SSD reads and deliberately keeps the table out of RAM and out of the
+page cache — the engine's own help says so. Reading from an SSD on every token is what costs the
+code path its ~27 tok/s; prose reuses rows heavily and barely notices.
+
+`ram` is the intuitive fix — map the table and lock the whole thing — and it works, right up
+until the memory accounting. Pinning 26.8 GiB drives `MemFree` to **603 MB**; the kernel then
+starts reclaiming the process's *own* anonymous pages, and the counters say so:
+
+```
+VmSwap       1.45 GiB      allocstall_normal   172,228
+pswpin       309,450        compact_stall       324,567
+pgmajfault    73,578
+```
+
+Those stalls are worth understanding because they lie about their cause: during a stall the
+engine's own decode rate stays normal, and a client sees tens of seconds of wall clock with no
+slowdown recorded on the device. **The stall is page reclaim, not compute.**
+
+`mmap` gets the same class of decode improvement without any of that. It maps the table into the
+page cache and does not lock it, so the rows that are being used stay resident and the rest is
+reclaimable under pressure. `VmRSS` splits as `Anon 52.3 GiB + File 29.1 GiB` — the table is
+counted as clean file pages, which the kernel can drop for free instead of swapping.
+
+**Net: `mmap` ≈ `ram` on decode, ±25 GiB on memory, and it removes the stalls entirely.** The
+repository ships `PLE_IO=mmap`. Verify the mode took effect with:
+
+```bash
+grep -E "VmRSS|VmLck|VmSwap" /proc/$(pgrep -f "build/strata --serve" | head -1)/status
+# mmap: VmLck 0 kB, VmSwap 0 kB   -- ram: VmLck ~26.8 GB
+```
+
+### Kernel `vm.*` tuning — measured, and a loss here
+
+With `ram` pinning the table the pressure looked like something the kernel could be tuned out of,
+so six settings were swept (`min_free_kbytes`, `watermark_scale_factor`, `swappiness`,
+`THP defrag`, `vfs_cache_pressure`, `zone_reclaim_mode`). Best combination moved prose **-2.2%**
+and code not at all. Two traps worth recording:
+
+- **`watermark_scale_factor=200` makes things worse, not better.** It scales the watermarks by a
+  percentage of the zone; on this 60 GiB zone it put `low` at **2 GB**, above `MemFree`, so the
+  kernel sat permanently below its own low watermark and reclaimed continuously. If you touch it,
+  **25 is the practical ceiling** here.
+- **`swappiness=0` increases thrashing**, counter-intuitively: `pswpin` rose 59% (183k pages)
+  because pages evicted under pressure are immediately needed back. Zero is not "never swap", it
+  is "swap only under duress" — and this machine is under duress.
+
+**The one clean win is `THP defrag=never`**, which took `compact_stall` from a 325k running total
+to an increment of **+1** across a full benchmark run, with no downside measured. It is kept as a
+separate recommendation exactly because the rest of the sweep is not worth having:
+
+```bash
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+```
+
+The general lesson: **the memory pressure here has a source (`ram` pinning 26.8 GiB) and tuning
+the kernel only moves the cost around.** Fixing the source with `mmap` beat every kernel setting
+tried, and by a wide margin.
+
 ---
 
 ## Losers
@@ -143,6 +213,29 @@ many slots fit**, which is what 512K competes for.
 
 Every one inside a 3 tok/s band whose own IQR is 7.8. `--no-fused-gr` did not start at all in
 this build. Do not chase these.
+
+### Calibrator settings — the defaults are right on homogeneous hardware
+
+The engine's calibrator (`setup.sh --calibrate`, 0.1.19+) names `--pcie-frac`, `--spec-min-p` and
+`--pool-workers` as the settings that depend more on the PC than on the model, and its defaults
+were measured on a 6-core consumer desktop. There is a widely-quoted community result where
+`--pool-workers` gave **3×** — on an Intel hybrid CPU, where E-cores were dragging the verify
+window. Neither of those conditions holds here, and the defaults won every arm:
+
+| Setting | Prose | Code | vs. default |
+| --- | --: | --: | --- |
+| *default* | **77.0** | **103.1** | — |
+| `--pcie-frac 0` / `0.25` / `0.5` | 74.7 / 76.4 / 75.5 | 99.6 / 99.8 / 101.4 | all lower |
+| `--pool-workers 12` / `16` / `23` | 76.0 / 77.0 / 76.0 | 100.0 / 100.4 / 98.2 | all lower |
+| `--host-core last` | 76.3 | 101.2 | lower |
+| `--lookup-chain 2` / `4` | 76.1 / 73.7 | 99.8 / 100.8 | lower |
+
+`--host-core` exists because *Windows* routes a GPU's interrupts to one logical processor; there
+is no equivalent problem on Linux. `--lookup-chain` is opt-in and only pays when the prompt
+contains long repeated spans. **The two lessons: check whether a quoted speed-up came from a
+hybrid CPU before chasing it, and do not shrink `--pool-workers` to one NUMA node's core count on
+a dual-socket box** — the engine already handles the cross-node case, and the measurement says
+cutting workers costs more than the crossing does.
 
 ### `--kv q4_0` — see the winners table
 

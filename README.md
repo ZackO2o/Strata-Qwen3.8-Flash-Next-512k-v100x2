@@ -1,7 +1,7 @@
 # Strata-Qwen3.8-Flash-Next-512k-v100x2
 
 **A 125B mixture-of-experts model, uncensored, 512K tokens of context and image input, served
-from two six-year-old Tesla V100 32G cards — at 64 tok/s decode and up to 1,684 tok/s prefill.**
+from two six-year-old Tesla V100 32G cards — at 74 tok/s decode on prose and 100 tok/s on code.**
 
 Two Tesla V100-PCIE-32G (Volta, sm_70), cards NVIDIA no longer supports in the engine's
 prebuilt binaries. [Strata](https://github.com/Niko1221/Strata) is a CPU+GPU hybrid MoE engine
@@ -14,12 +14,13 @@ took: the build, the memory arithmetic, the tuning, the measurements, and the de
   ~6B active), 78.5 GiB in two shards, served through the OpenAI-compatible API
 - Context: **524,288 tokens** a request (YaRN 2× extrapolation over the model's native 262,144)
 - Vision: yes, the model's own encoder, run on the GPU
-- Decode: **64.4 tok/s** median, prose and code alike, 512-token outputs (IQR 4.5)
+- Decode: **74.1 tok/s** prose, **100.0 tok/s** code, 512-token outputs (prose IQR 2.7)
 - Prefill: **1,684.1 tok/s** at ~16K cold; 1,082.3 tok/s at ~4K, where fixed cost still bites
 - Retrieval: correct at 8K, 30K, 121K and **241K tokens**
 - Prompt reuse: **82× faster** on a repeat, and the cache survives a restart
 - Memory: about **120 GiB of system RAM and 64 GiB of VRAM** — one of these cards, or one
   desktop-class GPU with 24 GB, is not enough; you need the pair
+- Concurrency: the engine serves **one request at a time**; four concurrent requests queue
 - One command: `./start.sh` sets up and starts it; `./stop.sh` stops it
 
 This is the V100 counterpart to the
@@ -114,26 +115,36 @@ reading; the method is described at the top of that file and the reasons it matt
 
 | | Median | IQR | Range | Reply length |
 | --- | --: | --: | --: | --: |
-| Prose | **64.4 tok/s** | 4.5 | 57.9 – 67.7 | 2,589 chars |
-| Code | **64.4 tok/s** | 3.2 | 62.1 – 73.7 | 2,279 chars |
+| Prose | **74.1 tok/s** | 2.7 | 70.3 – 75.7 | ~1,600 chars |
+| Code | **100.0 tok/s** | 2.9 | 98.0 – 104.6 | ~2,300 chars |
 
-**Read the IQR before reading the median.** 4.5 tok/s of spread on a 64.4 median is 7% — larger
-than several of the tuning effects documented below. Any single-run comparison between two
-configurations on this hardware is noise unless it clears that band.
+**Read the IQR before reading the median.** 2.7 tok/s of spread on a 74.1 median is 3.6%. Any
+single-run comparison between two configurations on this hardware is noise unless it clears that
+band.
 
-Concurrency, aggregate and per-request (512-token outputs, all requests identical):
+The gap between prose and code is real and reproducible: the n-gram/PLE table is read once per
+token, and code tokenizes into a much more scattered distribution — so more distinct table rows
+are touched, and the difference between reading them from SSD and finding them cached is larger.
+Prose reuses rows far more. It is the reason `--ple-io` is set at all, and the reason its effect
+is workload-dependent rather than a flat percentage.
 
-| Concurrent | Wall clock | Aggregate | Per request |
-| --: | --: | --: | --: |
-| 1 | 8.5 s | 60.3 tok/s | 61.1 tok/s |
-| 2 | 16.2 s | **63.1 tok/s** | 64.0 tok/s |
-| 4 | 32.9 s | 62.3 tok/s | 63.2 tok/s |
+Concurrency, aggregate and per-request (1,024-token outputs, all requests identical):
 
-Aggregate is flat from 1 to 4 — the engine serialises requests, and per-request speed does not
-collapse the way it does under `--batch` (see [below](#5---batch-concurrency-is-a-loss-here-and-we-can-show-why)).
-A single-request decode rate of ~64 tok/s *is* the ceiling here, so concurrency buys throughput
-only by queueing, not by parallelism. That is the honest shape of this configuration: it serves
-one request at full speed, and four requests arrive in the order they were sent.
+| Concurrent | Wall clock | Aggregate | Per request | Speed-up |
+| --: | --: | --: | --: | --: |
+| 4 | 57.1 s | 71.7 tok/s | 76.5 – 81.9 tok/s | **0.90×** |
+
+Aggregate is flat and the speed-up is **below 1** — the engine serialises requests. Per-request
+speed does not collapse the way it does under `--batch` (see
+[below](#5---batch-concurrency-is-a-loss-here-and-we-can-show-why)); each request still decodes at
+its full rate, in the order it was sent. A single-request decode rate of ~78–100 tok/s *is* the
+ceiling here, so four requests buy no throughput over queueing them.
+
+**An earlier version of this section claimed a 2.48× speed-up.** That measurement used replies of
+300–400 tokens, which finish early enough that the queue looks parallel. On 1,024-token replies the
+ratio is 0.90×. The 2.48× was a measurement artefact, and it is recorded rather than deleted
+because the same trap is easy to fall into: **a concurrency test must run every request to a full
+long output before the wall clocks are compared.**
 
 ### Prefill
 
@@ -234,8 +245,17 @@ real photograph, and we publish no vision accuracy figure.
 
 ## Why these numbers
 
-Five things decided the decode rate, in order of how much they mattered. Each was measured;
-three of them are counter-intuitive.
+Six things decided the decode rate, in order of how much they mattered. Each was measured;
+several of them are counter-intuitive.
+
+### 0. `--ple-io mmap` — the largest single change, and it is not a flag anyone reaches for
+
+The 28.8 GiB shard 2 is the n-gram/PLE table, read once per token. The engine's default
+(`direct`) reads it unbuffered from SSD and keeps it out of RAM entirely. Mapping it into the
+page cache — `--ple-io mmap`, without locking — is worth **+27 tok/s on code** and no measurable
+memory cost. The full three-arm comparison, and why the obvious `ram` variant is a net loss, is in
+[docs/TUNING.md](docs/TUNING.md). This one leads the list because it moved the code path more than
+every draft-window and KV setting combined.
 
 ### 1. `--spec 4` beats `--spec 8`, and `--spec-min-p 0.70` beats 0.85
 
@@ -399,6 +419,7 @@ the image or the scripts.
 | `SPEC_MIN_P` | `0.70` | Draft acceptance floor |
 | `KV` | `int8` | KV storage. `fp16` costs VRAM, `q4_0` is 6% **slower** — the dequantization outweighs the memory saved |
 | `KV_RESIDENT` | `20480` | KV tokens kept in pinned host RAM. Required at 512K |
+| `PLE_IO` | `mmap` | n-gram/PLE table read path. `mmap` keeps hot rows cached without pinning; `ram` locks 26.8 GiB and is a net loss — see [TUNING.md](docs/TUNING.md) |
 | `LAYER_SPLIT` | `20` | First layer on the second card. 48 layers, so this is 20/28 — see [below](#why-layer-split-and-not-a-peer-cache) |
 | `CONV_CACHE_DISK_GIB` | `25` | On-disk conversation cache, survives restarts |
 | `EXPERT_PROFILE_SAVE` | `1` | Persist what the adaptive tier learned; reload it on the next start |
@@ -435,11 +456,12 @@ Stated plainly so nobody cites this as more than it is:
   multi-day soak.
 - **Anything about a third card.** Untested here.
 
-## Two ways this document was wrong before it was right
+## Three ways this document was wrong before it was right
 
-Both errors were ours, both produced confident and plausible numbers, and both are the reason the
-benchmark reads the engine's counters instead of a stopwatch. Recording them because a reader
-deserves to know which figures were once overstated.
+All three errors were ours, all three produced confident and plausible numbers, and they are why
+the benchmark reads the engine's counters instead of a stopwatch and why every concurrency figure
+now runs to a full long output. Recording them because a reader deserves to know which figures
+were once overstated.
 
 1. **Prefill measured from client wall-clock, with cache hits mixed in.** The first version timed
    the HTTP call and divided by the prompt length. On a 32K prompt that had been partly cached it
@@ -454,6 +476,13 @@ deserves to know which figures were once overstated.
    and a prefill figure that was one cached request repeated. A zero IQR on ten runs is not
    precision; it is a matching bug. Records are now matched on a request id plus a timestamp
    watermark, and `bench.py` documents both traps at the top.
+
+3. **A concurrency speed-up measured on replies too short to reach the queue.** An interim
+   write-up reported **2.48×** from four concurrent requests. Those requests produced 300–400
+   tokens each and finished early enough that the aggregate looked parallel. Re-run with
+   1,024-token replies the ratio is **0.90×** — the serialisation the engine's documentation
+   describes. A concurrency test has to make every request run long enough to actually be in the
+   queue at the same time; short replies measure the client's thread pool, not the server.
 
 If you re-run this benchmark on your own pair and get an IQR of 0.0, you have hit the second bug,
 not a perfectly stable machine.

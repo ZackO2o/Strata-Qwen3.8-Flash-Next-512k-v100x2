@@ -52,6 +52,11 @@ if g.get("EXPERT_PROFILE_SAVE") == "1":
     args += ["--expert-profile-save", g["EXPERT_PROFILE"],
              "--expert-profile-save-every", g["EXPERT_PROFILE_SAVE_EVERY_MIN"]]
 
+# The n-gram/PLE table's read path. mmap keeps the hot rows in the page cache without pinning
+# them; see scripts/config.sh for the measured comparison against direct and ram.
+if g.get("PLE_IO"):
+    args += ["--ple-io", g["PLE_IO"]]
+
 # The shard the engine reads the PLE table from. See docs/FAILURE_MODES.md before changing it.
 cfg = {
     "exe": f"{g['STRATA_DIR']}/build/strata",
@@ -85,6 +90,7 @@ PY
 export MODEL_DIR STRATA_DIR UPSTREAM_DIR LLAMA_DIR DATA_DIR CONV_CACHE_DIR
 export MODEL_GGUF PLE_GGUF MMPROJ MODEL_NAME SERVICE_NAME API_KEY_FILE CUDA_HOME
 export SPEC SPEC_MIN_P KV KV_RESIDENT VRAM_RESERVE_MIB LAYER_SPLIT GPU0 GPU1
+export PLE_IO
 export CONV_CACHE_DISK_GIB EXPERT_PROFILE_SAVE EXPERT_PROFILE_SAVE_EVERY_MIN
 export CTX_512K PORT HOST
 

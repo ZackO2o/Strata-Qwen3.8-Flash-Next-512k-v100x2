@@ -51,6 +51,15 @@ KV="${KV:-int8}"
 KV_RESIDENT="${KV_RESIDENT:-20480}"
 VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-700}"    # held for the vision encoder
 
+# ── PLE / n-gram table I/O ───────────────────────────────────────────────────
+# Shard 2 (28.8 GiB) is read on every token. direct (the engine default) reads it unbuffered
+# from SSD and never lets it into RAM; ram locks the whole table into RAM and is a net loss here
+# (26.8 GiB pinned -> MemFree 603 MB -> the kernel swaps the process's own pages out); mmap maps
+# it into the page cache unlocked, so the hot rows stay cached and the rest is reclaimable.
+# Measured: direct 73.0/72.6, ram 75.8/98.8, mmap 74.1/100.0 (prose/code). mmap is the setting
+# this repository ships.
+PLE_IO="${PLE_IO:-mmap}"
+
 # ── Multi-GPU ────────────────────────────────────────────────────────────────
 # 48 layers; 20 means layers 0–19 on card 0 and 20–47 on card 1. Layer split rather than a peer
 # cache: each card keeps its own layers' experts and no token crosses during decode. See
