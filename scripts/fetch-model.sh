@@ -46,8 +46,9 @@ fetch() {
 }
 
 say "Downloading the model"
-fetch "$HF_MIRROR/$HF_GGUF_REPO/resolve/main/$(basename "$MODEL_GGUF")" "$MODEL_GGUF"
-fetch "$HF_MIRROR/$HF_GGUF_REPO/resolve/main/$(basename "$PLE_GGUF")"  "$PLE_GGUF"
+# Weights live under a per-tier subdirectory in the abliterated repository.
+fetch "$HF_MIRROR/$HF_GGUF_REPO/resolve/main/$HF_GGUF_SUBDIR/$(basename "$MODEL_GGUF")" "$MODEL_GGUF"
+fetch "$HF_MIRROR/$HF_GGUF_REPO/resolve/main/$HF_GGUF_SUBDIR/$(basename "$PLE_GGUF")"  "$PLE_GGUF"
 fetch "$HF_MIRROR/$HF_MMPROJ_REPO/resolve/main/$(basename "$MMPROJ")"  "$MMPROJ"
 
 # ── Sanity check: the PLE shard's shape ──────────────────────────────────────

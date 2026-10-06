@@ -20,11 +20,32 @@
 
 ## Weights and model
 
-- **Qwen3.8-Flash-Next** by **Qwen / Alibaba** — 125B MoE, 24,576 experts, ~6B active per token.
-- **ISTA-DASLab GSQ-RCO** — the quantization scheme and process behind the GGUF series.
-- **The `Swift-1.5` abliterated `IQ3_S` derivative** — the two-shard build used here.
-  Abliteration modifies the weights; read its model card for its own terms rather than assuming
-  the base model's apply.
+- **Qwen3.8-Flash-Next** by **Qwen / Alibaba** — 125B MoE across 48 layers, 24,576 experts,
+  ~6B active per token, text and image input, MTP head.
+
+- **Swift 1.5** by **[UkisAI](https://ukisai.com/swift-1-5-flash-next)** — the
+  reasoning-efficiency derivative this recipe actually serves. Their published claim is 63.4%
+  fewer thinking tokens at ~1.8× speed with under 1% accuracy loss; the token efficiency is why
+  a fixed decode rate produces usable answers sooner. Available as
+  [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF)
+  and
+  [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
+
+- **ISTA-DASLab GSQ-RCO** — the per-tensor mixed-precision allocation scheme. UkisAI reuses
+  these allocation profiles for the Swift tiers; the KLD figures on their model card come from
+  that work.
+
+- **[SC117](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)**
+  — the abliterated `IQ3_S` build measured here. Rather than re-quantizing, it transplants 144
+  residual-stream-writing tensors across all 48 layers by byte-level GGUF-to-GGUF transfer from
+  [orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF),
+  leaving every GSQ scale untouched and the file size within 0.2% of upstream. Worth crediting
+  as a technique, not just as a file: re-quantizing an abliterated model would cost quality the
+  transplant avoids, which is why the token efficiency survives it.
+
+- **Licensing**: the base **Qwen Community License 1.0** carries over and **Swift Open License
+  v1.0** governs the derivative — commercial use free only below US$1M annual revenue. The
+  abliteration is a behavioural change from the base model, not a cosmetic one.
 
 ## Measurement discipline
 

@@ -1,7 +1,7 @@
-# Qwen3.8-Flash-Next 125B MoE on Tesla V100 32G × 2, 512K context
+# Strata-Qwen3.8-Flash-Next-512k-v100x2
 
 **A 125B mixture-of-experts model, uncensored, 512K tokens of context and image input, served
-from two six-year-old Tesla V100 32G cards — at 64–79 tok/s decode and up to 1,863 tok/s prefill.**
+from two six-year-old Tesla V100 32G cards — at 64 tok/s decode and up to 1,684 tok/s prefill.**
 
 Two Tesla V100-PCIE-32G (Volta, sm_70), cards NVIDIA no longer supports in the engine's
 prebuilt binaries. [Strata](https://github.com/Niko1221/Strata) is a CPU+GPU hybrid MoE engine
@@ -10,12 +10,14 @@ community test path and will not ship in the prebuilt engine. We build it oursel
 [V100 fork](https://github.com/jmnargi/Strata-V100), and this repository is everything that
 took: the build, the memory arithmetic, the tuning, the measurements, and the dead ends.
 
-- Model: **Qwen3.8-Flash-Next** 125B MoE (24,576 experts, ~6B active), `abliterated`, `IQ3_S`,
-  **77.9 GiB** in two shards — served through the OpenAI-compatible API
+- Model: **Swift 1.5 Qwen3.8-Flash-Next**, abliterated, `IQ3_S` — 125B MoE (24,576 experts,
+  ~6B active), 78.5 GiB in two shards, served through the OpenAI-compatible API
 - Context: **524,288 tokens** a request (YaRN 2× extrapolation over the model's native 262,144)
 - Vision: yes, the model's own encoder, run on the GPU
-- Decode: **71.3 tok/s** prose, **69.4 tok/s** code (512-token outputs)
-- Prefill: **1,611.8 tok/s** at 14.5K, **1,862.6 tok/s** at 29K
+- Decode: **64.4 tok/s** median, prose and code alike, 512-token outputs (IQR 4.5)
+- Prefill: **1,684.1 tok/s** at ~16K cold; 1,082.3 tok/s at ~4K, where fixed cost still bites
+- Retrieval: correct at 8K, 30K, 121K and **241K tokens**
+- Prompt reuse: **82× faster** on a repeat, and the cache survives a restart
 - Memory: about **120 GiB of system RAM and 64 GiB of VRAM** — one of these cards, or one
   desktop-class GPU with 24 GB, is not enough; you need the pair
 - One command: `./start.sh` sets up and starts it; `./stop.sh` stops it
@@ -25,88 +27,210 @@ This is the V100 counterpart to the
 same shape of problem — a large MoE that does not fit one device — solved on hardware that is
 five generations behind, for a fraction of the money.
 
+## The model, and exactly where it comes from
+
+Every file this recipe loads, and where to get it:
+
+| Component | Source | File | Size |
+| --- | --- | --- | ---: |
+| Weights, shards 1–2 | [SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) | `IQ3_S/…-abliterated-IQ3_S-00001-of-00002.gguf` | 47.3 GB |
+| | the same repository | `IQ3_S/…-abliterated-IQ3_S-00002-of-00002.gguf` | 28.8 GB |
+| Vision encoder | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | `mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf` | 0.91 GB |
+| MTP draft head | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF) | extracted from the full-precision shards at pack time | — |
+
+Both weight shards are required and they are not interchangeable. **Shard 2 goes to `--ple-gguf`**
+because it carries the per-layer embedding table; shard 1 goes to `--native`. Read
+[the two things that cost us the most](#the-two-things-that-cost-us-the-most) before substituting
+a different quantization — a merged single-file variant of this same model loads, passes every
+integrity check, and then emits one token forever.
+
+`fetch-model.sh` downloads all four, verifies each against the mirror's own `Content-Length`, and
+refuses to continue if the PLE shard is the wrong shape.
+
+### What the model is
+
+- **Qwen3.8-Flash-Next** — [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), 125B
+  parameters of mixture-of-experts across 48 layers, 24,576 experts, roughly 6B active per
+  token. Text and image input, MTP head for speculative drafting.
+
+- **Swift 1.5** — [UkisAI](https://ukisai.com/swift-1-5-flash-next)'s reasoning-efficiency
+  derivative of the base. On their published comparison it emits 63.4% fewer thinking tokens at
+  roughly 1.8× the speed with accuracy loss under 1% at the highest reasoning setting. That
+  property is most of why this build is pleasant to serve: **a model that thinks in fewer tokens
+  is faster at the same decode rate**, and it is why the reasoning budget here is left at the
+  model's default rather than clamped down. The upstream specifies 89.6% on GPQA-Diamond at
+  `xhigh`; we have not reproduced that and publish no accuracy figure of our own.
+
+- **GSQ-RCO** — the mixed-precision quantization profile: per-tensor bit allocation learned on
+  this model, reusing allocation budgets from the ISTA-DASLab GSQ-RCO series.
+  `IQ3_S` is the tier measured here. The upstream repository publishes four:
+  `IQ3_XXS` 76.0 GB, `IQ3_S` 77.9 GB, `IQ2_XS` 68.2 GB, and an experimental `Q2_0` at 66.6 GB,
+  each with a development KLD. We ran only `IQ3_S` and publish numbers for nothing else —
+  **if your pair has less room than ours, those tiers are the lever, and the KLD column on the
+  model card is the honest way to pick one.**
+
+- **Abliterated** — the derivation matters and is unusual, so: the abliterated build
+  ([SC117](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF))
+  transplants 144 tensors across all 48 layers by **byte-level GGUF-to-GGUF transfer**, taking
+  those bytes from a ready-made uncensored release while leaving every GSQ scale untouched. File
+  size moves under 0.2%, and the source reports Swift's reasoning efficiency surviving the
+  transplant. The refusal behaviour is gone; this is a behaviourally different model from base
+  Qwen3.8-Flash-Next, and the practical consequence for serving is that nothing filters a
+  request on the way in.
+
+**Licence, and read this before deploying commercially:** the base **Qwen Community License 1.0**
+carries over, and **Swift Open License v1.0** governs the derivative — commercial use is free
+only below US$1M annual revenue. Model files are downloaded at first run and are not part of this
+repository; nothing here grants any right to the weights. See [NOTICE](NOTICE).
+
+### Tiers, for smaller cards
+
+The upstream publishes the same series in four quantizations with published KLD. We measured
+`IQ3_S` only:
+
+| Tier | Two-shard total | Development KLD |
+| --- | --: | --: |
+| `IQ3_XXS` | 76.0 GB | 0.240 |
+| **`IQ3_S`** (measured here) | **77.9 GB** | — |
+| `IQ2_XS` | 68.2 GB | 0.341 |
+| `Q2_0` (experimental) | 66.6 GB | 0.424 |
+
 ## Performance
 
 Two Tesla V100-PCIE-32G, Xeon E5-2673 v3 (48 threads), 125 GiB RAM, CentOS Stream 9,
-driver 580.159.04, CUDA 12.4, engine built from the V100 fork at `310e5cb`, context 524,288,
-`--kv int8 --kv-resident 20480`, `--spec 4 --spec-min-p 0.70`. Measured through the
-OpenAI API on the loopback interface, from the same machine.
+driver 580.159.04, CUDA 12.4, engine built from the V100 fork at `310e5cb`, **context 524,288**,
+`--spec 4 --spec-min-p 0.70 --kv int8 --kv-resident 20480`, the on-disk conversation cache and
+the pre-filled expert profile. Measured through the OpenAI API on loopback, from the same machine.
+
+**Every figure comes from the engine's own accounting** — `/metrics` reports `prompt_ms`,
+`decode_ms`, `ttft_ms`, `prompt_read` and `prompt_total` per request, so prompt processing and
+decoding are separated rather than blended into one wall-clock number. `tools/bench.py` does the
+reading; the method is described at the top of that file and the reasons it matters are in
+[What we did not measure](#what-we-did-not-measure).
 
 ### Decode
 
-Aggregate is what a caller sees across all in-flight requests; per-request is what each one gets.
+512-token outputs, 12 runs each, the first 2 discarded, median with the interquartile range:
 
-| Concurrent requests | Prose, aggregate | Prose, per request | Code, aggregate | Code, per request |
-| --: | --: | --: | --: | --: |
-| 1 | **64.1 tok/s** | 64.1 tok/s | — | — |
-| 2 | 63.1 tok/s | 48.2 tok/s | — | — |
-| 4 | 64.2 tok/s | 33.4 tok/s | — | — |
+| | Median | IQR | Range | Reply length |
+| --- | --: | --: | --: | --: |
+| Prose | **64.4 tok/s** | 4.5 | 57.9 – 67.7 | 2,589 chars |
+| Code | **64.4 tok/s** | 3.2 | 62.1 – 73.7 | 2,279 chars |
 
-Single-request decode by output length, medians of three runs each, prompt 133 tokens:
+**Read the IQR before reading the median.** 4.5 tok/s of spread on a 64.4 median is 7% — larger
+than several of the tuning effects documented below. Any single-run comparison between two
+configurations on this hardware is noise unless it clears that band.
 
-| Output | Prose | Code |
-| --: | --: | --: |
-| 128 tokens | 78.5 tok/s | 69.5 tok/s |
-| 512 tokens | 55.0–62.7 tok/s (57.5) | 61.2–66.0 tok/s (64.4) |
-| 2048 tokens | 73.2–81.8 tok/s (78.7) | 64.8–66.8 tok/s (66.2) |
+Concurrency, aggregate and per-request (512-token outputs, all requests identical):
 
-Code is slower than prose, consistently, by about 15% at 2048 tokens: code is where the draft
-head earns least (see [Why these numbers](#why-these-numbers)).
+| Concurrent | Wall clock | Aggregate | Per request |
+| --: | --: | --: | --: |
+| 1 | 8.5 s | 60.3 tok/s | 61.1 tok/s |
+| 2 | 16.2 s | **63.1 tok/s** | 64.0 tok/s |
+| 4 | 32.9 s | 62.3 tok/s | 63.2 tok/s |
+
+Aggregate is flat from 1 to 4 — the engine serialises requests, and per-request speed does not
+collapse the way it does under `--batch` (see [below](#5---batch-concurrency-is-a-loss-here-and-we-can-show-why)).
+A single-request decode rate of ~64 tok/s *is* the ceiling here, so concurrency buys throughput
+only by queueing, not by parallelism. That is the honest shape of this configuration: it serves
+one request at full speed, and four requests arrive in the order they were sent.
 
 ### Prefill
 
-| Prompt | Prefill | Wall time |
-| --: | --: | --: |
-| 186 tokens | 159.8 tok/s † | 1.16 s |
-| 981 tokens | 489.9 tok/s | 2.00 s |
-| 3,684 tokens | 993.7 tok/s | 3.71 s |
-| 14,549 tokens | 1,611.8 tok/s | 9.03 s |
-| 29,018 tokens | **1,862.6 tok/s** | 15.58 s |
+Prompt processing, from the engine's own `prompt_read` over its `prompt_ms`, **cold** — a fresh
+prompt for every row, because a repeat is served from the conversation cache and reports a
+figure that means nothing:
 
-† Short prompts are dominated by fixed startup cost — 1.2 s of it. Read that row as "even a
-one-line question costs about a second before the first token", not as a throughput figure.
+| Prompt | Tokens read | Engine prompt time | Throughput |
+| --: | --: | --: | --: |
+| ~256 | 315 | 1,736 ms | 181.5 tok/s |
+| ~1K | 1,004 | 1,892 ms | 530.8 tok/s |
+| ~4K | 3,707 | 3,425 ms | 1,082.3 tok/s |
+| ~16K | 14,572 | 8,653 ms | **1,684.1 tok/s** |
+
+Throughput climbs with length up to ~16K: the fixed cost of starting a request (about 1.7 s,
+dominating the first row) is amortised as the prompt grows. The ~32K row is deliberately absent
+from this table — the engine served it partly from cache and read only 12,657 of 29,041 tokens,
+so its 1,036.5 tok/s is a cache artefact and not comparable. A cold 32K measurement needs the
+cache disabled, which is a change to the configuration rather than to the benchmark.
+
+**These prefill numbers are lower than an earlier draft of this file claimed.** That draft derived
+throughput from client wall-clock and mixed in decode time and cache hits; it published 5,577
+and 9,270 tok/s for 16K and 32K prompts, which are not physically available from these cards.
+The engine's own counters give the figures above. If you see a double-digit-thousands prefill
+number from a single-V100-class setup, suspect the measurement before believing the hardware.
 
 ### Long context
 
-Needle in a haystack, one sentence planted in the middle of filler, asked to quote it exactly:
+Needle retrieval — one sentence planted at the midpoint of filler, asked to quote it exactly.
+The reply is quoted verbatim from the reply field, including the model's visible reasoning:
 
-| Document | Actual prompt | Result | Wall time |
+| Document | Actual prompt | Result | Prompt time |
 | --: | --: | :-: | --: |
-| ~8K tokens | 7,621 | found | 7.6 s |
-| ~32K tokens | 30,229 | found | 12.6 s |
-| ~131K tokens | 120,665 | found | 56.7 s |
+| ~8K | 7,621 tok | **found** | 2,088 ms |
+| ~32K | 30,229 tok | **found** | 5,716 ms |
+| ~131K | 120,665 tok | **found** | 62,734 ms |
+| ~262K | 241,255 tok | **found** | 17,813 ms |
 
-512K is the configured ceiling; the largest *tested* retrieval is 120,665 tokens. We have not
-run a full 512K-token recall test — see [What we did not measure](#what-we-did-not-measure).
+**All four depths retrieve correctly**, including a 241,255-token prompt — the deepest test this
+repository runs, and past the model's native 256K window. That last row's prompt time is *lower*
+than the row above it because it was partly served from the conversation cache after the 120K
+run; treat it as a correctness result, not a throughput one.
+
+512K is the configured ceiling. The largest **cold** retrieval tested is 120,665 tokens; we have
+not run a full 512K-token recall test, and say so in
+[What we did not measure](#what-we-did-not-measure).
 
 ### Prompt reuse
 
-| Prompt | First time | Next time |
-| --: | --: | --: |
-| The same 3,684-token prompt, sent again | 2,460 ms | **848 ms** |
-| The same prompt a third time | — | **561 ms** |
+The same 3,684-token prompt, sent three times:
 
-Resuming is a real 3–4× at this size, and it is the reason multi-turn conversation is cheap:
-an append-only session pays prefill once and then reads back. Strata's own conversation cache
-also survives a **restart** here (`--conversation-cache-disk`, 25 GiB on disk): a parked
-3,444-token conversation came back in 984.5 ms against 3,089 ms cold.
+| Send | Engine prompt time | Client wall clock |
+| --: | --: | --: |
+| First | 4,258 ms | 5,138 ms |
+| Second | **52 ms** | 572 ms |
+| Third | **47 ms** | 586 ms |
+
+An **82× reduction in prompt processing time** on the second send, because the KV state is
+already there. This is what makes multi-turn conversation cheap: an append-only session pays
+prefill once and then reads back.
+
+The on-disk conversation cache extends that across a **restart** — `--conversation-cache-disk`,
+25 GiB here. A parked 3,444-token conversation came back in 984.5 ms against 3,089 ms cold
+(3.1×), and the disk record was 843 MB.
 
 ### Streaming
 
 | | |
 | --: | --: |
-| Time to first token | **88 ms** (short prompt, warm) |
-| Chunk interval p50 | 21 ms |
-| Chunk interval p95 | **36 ms** |
-| 2,048-token reply, wall clock | 38.8 s |
+| Chunk interval p50 | 20 ms |
+| Chunk interval p95 | **37 ms** |
+| 2,048-token reply, wall clock | 34.2 s |
+| Chunks delivered | 2,047 |
+| Characters in the reply | 8,079 |
+
+The p95 of 37 ms is the number that matters for perceived smoothness: it is the slowest 5% of
+inter-token gaps, and it stays inside a comfortable reading budget. The 2,047 chunks for an
+8,079-character reply is roughly 4 characters per chunk, which is the MTP draft being emitted in
+batches rather than one token at a time.
+
+These interval figures are measured from the client, because they describe what a client
+experiences. They are **not** the decode rate: the same run's engine-side decode rate is the
+64.4 tok/s in the table above, and the difference between the two is the reasoning trace, which
+arrives in `reasoning_content` and inflates the chunk count without adding answer text.
 
 ### Vision
 
 The model's own encoder, on the GPU, `--vram-reserve-mib 700`. A generated test card reading
-`STRATA 512K` with a red-outlined rectangle and a blue ellipse comes back described
-literally — the string read character for character, both shapes named with their colours and
-positions. OCR of a synthetic image is a smoke test, not a benchmark: it tells you the tower is
-wired up and the image reached the model, nothing about accuracy on hard images.
+`STRATA 512K` with a red-outlined rectangle and a filled blue ellipse comes back described
+literally:
+
+> **Text:** The string "STRATA 512K" appears in black, uppercase, sans-serif characters,
+> left-aligned inside the rectangle
+
+OCR of a synthetic image is a **smoke test, not a benchmark**. It tells you the encoder binary
+ran, the image reached the model, and the text came back — it says nothing about accuracy on a
+real photograph, and we publish no vision accuracy figure.
 
 ## Why these numbers
 
@@ -175,8 +299,14 @@ KV state is resident VRAM and so is the expert cache; on one card they are zero-
 | RoPE | none | **yarn, scale 2** |
 | Expert slots (primary) | 12,300 | **10,240** |
 | Expert-cache VRAM | 24.34 GiB | **18.46 GiB** |
-| Decode, prose 512 | 57.5 tok/s | 57.5 tok/s |
-| Prefill, 14.5K | 1,611.8 tok/s | **1,611.8 tok/s** |
+| `--kv-resident` | optional | **required** |
+
+Measured decode at the two windows sits inside the run-to-run spread (the 256K configuration
+measured 59.1 tok/s in one session and 63–66 in another; 512K measured 64.4 median with an IQR of
+4.5). **We therefore do not claim a decode cost for 512K** — on this hardware the difference is
+within noise, and asserting one from a single session would be exactly the mistake this
+repository warns about elsewhere. What 512K demonstrably costs is expert slots, and that is a
+memory fact rather than a speed claim.
 
 The two rows you would expect to differ are the same because `--kv-resident` moves the KV
 cache into pinned host RAM and leaves only the attention window on the card. It is **not
@@ -205,9 +335,10 @@ trade only pays where experts fit entirely in VRAM *and* contexts are short.
 ## Requirements
 
 - **Two Tesla V100 (or any sm_70 part) with 32 GB each.** 16 GB cards work but halve the expert
-  cache — a 16 GB pair measured 59–61 tok/s decode and 765 tok/s prefill against our 64–79 and
-  1,611–1,863 on 32 GB cards with the same model and nearly the same flags. **The V100 32G pair
-  is the recipe**; 16 GB cards are the budget version.
+  cache — a third-party 16 GB SXM2 pair measured 59–61 tok/s decode against our 64.4, and
+  765 tok/s prefill at 14.5K against our 1,684, on effectively the same model and flags. **The
+  32 GB pair is the recipe**; 16 GB cards are the budget version. See
+  [docs/COMPARISON.md](docs/COMPARISON.md).
 - **~120 GiB of system RAM.** The expert arena is memory-mapped and computed by CPU and GPU
   together; this is where the model lives. 64 GiB works for smaller quantizations at smaller
   context.
@@ -264,7 +395,7 @@ the image or the scripts.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `CTX_512K` | `1` | Write the 512K config, or the 256K one with the expert cache at full size |
-| `SPEC` | `4` | Draft window. Higher is *slower* past 4 — see [above](#1---spec-4-beats---spec-8-and---spec-min-p-070-beats-085). |
+| `SPEC` | `4` | Draft window. Higher is *slower* past 4 — see [above](#1--spec-4-beats--spec-8-and--spec-min-p-070-beats-085). |
 | `SPEC_MIN_P` | `0.70` | Draft acceptance floor |
 | `KV` | `int8` | KV storage. `fp16` costs VRAM, `q4_0` is 6% **slower** — the dequantization outweighs the memory saved |
 | `KV_RESIDENT` | `20480` | KV tokens kept in pinned host RAM. Required at 512K |
@@ -289,16 +420,43 @@ have anywhere to put the rest.
 
 Stated plainly so nobody cites this as more than it is:
 
-- **Full 512K-token recall.** Our deepest needle test is 120,665 tokens. 512K is configured and
-  the model loads and answers at it; recall quality across the whole window is untested.
+- **Full 512K-token recall.** Our deepest needle test is 241,255 tokens, and it retrieved
+  correctly. 512K is configured and the model loads and answers at it; recall at the very top of
+  the window is untested.
+- **Cold prefill beyond 16K.** The 32K row in the prefill table is contaminated by a
+  conversation-cache hit (the engine read 12,657 of 29,041 tokens). Every prefill figure quoted
+  as a throughput claim in this repository is from a cold prompt of 16K or less.
 - **Quality benchmarks.** No GSM8K, no HumanEval, no MMLU. We did not measure accuracy, and a
   `Q2/Q3`-class quantization is exactly where you would expect to find the cost of this recipe.
   Treat decode and prefill numbers here as safe to quote and quality numbers as absent.
-- **Concurrency beyond 4.** We tested 1, 2 and 4 and stopped when it was clear the aggregate was
-  flat and `--batch` was a loss.
+- **Concurrency beyond 4.** We tested 1, 2 and 4 and stopped when the aggregate proved flat.
+  Nothing here tells you what happens at 16.
 - **Long-run stability.** These are benchmark figures from a live server. We have not run a
   multi-day soak.
 - **Anything about a third card.** Untested here.
+
+## Two ways this document was wrong before it was right
+
+Both errors were ours, both produced confident and plausible numbers, and both are the reason the
+benchmark reads the engine's counters instead of a stopwatch. Recording them because a reader
+deserves to know which figures were once overstated.
+
+1. **Prefill measured from client wall-clock, with cache hits mixed in.** The first version timed
+   the HTTP call and divided by the prompt length. On a 32K prompt that had been partly cached it
+   reported **9,270 tok/s** for 524,288-capable V100s. The engine's own `prompt_read`/`prompt_ms`
+   says 1,684 tok/s at 16K cold. The published table now uses the engine's counters and a fresh
+   prompt per row.
+
+2. **Decode records matched by output-token count.** `/metrics` keeps a bounded list of recent
+   requests. The first version looked up the entry whose `output_tokens` matched the reply it had
+   just received — so ten runs that each produced exactly 512 tokens all matched the *same* older
+   record. The result was ten identical "measurements", a median with an IQR of literally **0.0**,
+   and a prefill figure that was one cached request repeated. A zero IQR on ten runs is not
+   precision; it is a matching bug. Records are now matched on a request id plus a timestamp
+   watermark, and `bench.py` documents both traps at the top.
+
+If you re-run this benchmark on your own pair and get an IQR of 0.0, you have hit the second bug,
+not a perfectly stable machine.
 
 ## The two things that cost us the most
 

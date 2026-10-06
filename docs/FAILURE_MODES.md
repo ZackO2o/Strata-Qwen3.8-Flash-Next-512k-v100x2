@@ -121,9 +121,15 @@ re-inventing it.
 
 ## 7. Short-prompt throughput is mostly startup cost
 
-A 186-token prompt "achieves" 159.8 tok/s and a 29K-token prompt achieves 1,862.6 tok/s. Neither
-number is wrong; the first one is nearly all fixed cost, about 1.2 s of it. **Never put the two
-in the same table** without saying so, and never quote the short one as a throughput figure.
+A ~256-token prompt reports 181.5 tok/s and a ~16K prompt reports 1,684.1 tok/s. Neither number
+is wrong; the first is nearly all fixed cost, about 1.7 s of it, and dividing a small token count
+by a large constant inflates the ratio. **Never put the two in the same table** without saying
+so, and never quote the short one as a throughput figure.
+
+The same trap caught us harder in the other direction: a cached 29K prompt once reported
+9,270 tok/s, because almost none of it was actually read. Prefill throughput is only meaningful
+against `prompt_read` on a **cold** prompt, which is why the README's table uses a fresh prompt
+per row and why the 32K row is omitted rather than published.
 
 ---
 

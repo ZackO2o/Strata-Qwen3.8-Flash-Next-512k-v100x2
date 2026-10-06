@@ -19,12 +19,19 @@ PLE_GGUF="${PLE_GGUF:-$MODEL_DIR/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterate
 MMPROJ="${MMPROJ:-$MODEL_DIR/mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf}"
 MODEL_NAME="${MODEL_NAME:-swift-1.5-flash-next-abliterated}"
 
-# Hugging Face repositories the fetch script pulls from. Point these at whatever you like;
-# the recipe only assumes a two-shard GGUF plus a matching mmproj.
-HF_GGUF_REPO="${HF_GGUF_REPO:-slider-meister-pub/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-GGUF}"
-HF_MMPROJ_REPO="${HF_MMPROJ_REPO:-slider-meister-pub/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-GGUF}"
-HF_MTP_REPO="${HF_MTP_REPO:-Qwen/Qwen3.8-Flash-Next}"    # base checkpoint, for the MTP draft head
-HF_MIRROR="${HF_MIRROR:-https://hf-mirror.com}"          # a mirror is often far faster
+# Hugging Face repositories the fetch script pulls from. Point these at whatever you like; the
+# recipe only assumes a two-shard GGUF plus a matching mmproj.
+#   weights: SC117's abliterated transplant of UkisAI's Swift 1.5 GSQ-RCO quants.
+#            The IQ3_S tier lives in an IQ3_S/ subdirectory of that repo.
+#   mmproj:  taken from UkisAI's own GSQ-RCO repository -- it is a standard CLIP GGUF shared
+#            across every tier, and in the SC117 repo it sits at the root.
+#   MTP:     the draft head is not in the quantized checkpoint at all; mtp_fetch.py reads it
+#            from the base full-precision release.
+HF_GGUF_REPO="${HF_GGUF_REPO:-SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF}"
+HF_GGUF_SUBDIR="${HF_GGUF_SUBDIR:-IQ3_S}"
+HF_MMPROJ_REPO="${HF_MMPROJ_REPO:-ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF}"
+HF_MTP_REPO="${HF_MTP_REPO:-ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF}"
+HF_MIRROR="${HF_MIRROR:-https://huggingface.co}"          # swap for hf-mirror.com if that is faster
 
 # ── Context ──────────────────────────────────────────────────────────────────
 CTX_512K="${CTX_512K:-1}"            # 1 → 524,288 tokens with YaRN 2×; 0 → 262,144

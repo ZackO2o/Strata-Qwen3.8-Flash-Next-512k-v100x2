@@ -1,35 +1,51 @@
 #!/usr/bin/env python3
-"""Every performance number in the README, from one run against a live server.
+"""Every performance number in the README, taken from the server's own accounting.
 
-    python3 tools/bench.py                       # everything
-    python3 tools/bench.py --only decode         # one section
+    python3 tools/bench.py                    # everything
+    python3 tools/bench.py --only decode      # one section
     PORT=8080 python3 tools/bench.py --json out.json
 
-Method, which matters more than any single figure here:
-  * 12 runs per decode configuration, the first 2 discarded (cold start and cache warm-up)
-  * median reported, with the interquartile range beside it
-  * one variable at a time; restart between configurations if you are A/B-ing
+Why the engine's numbers and not the client's:
+
+  Wall-clock around an HTTP call measures the client's serialization, the socket and the
+  model's thinking, all blended together. The engine already accounts for each phase exactly --
+  `prompt_ms`, `decode_ms`, `ttft_ms`, `prompt_read`, `prompt_total`, `reused_tokens` -- and
+  reports them per request in `/metrics` under `requests[]`. Reading them means the published
+  figures are the engine's own measurements rather than ours, and prompt processing stays
+  separate from decoding instead of being averaged into one number.
+
+  `prefill_tok_s` is `prompt_read / prompt_ms`: tokens the engine actually recomputed over its
+  own prompt time. That is why a cache hit legitimately reports a very high figure -- almost
+  nothing was read -- and why the prefill table below uses a fresh prompt for every row.
+
+Two traps this avoids, both of which produced wrong numbers in earlier drafts:
+
+  1. A thinking model returns its chain of thought in `reasoning_content` and leaves `content`
+     empty. A benchmark reading only `content` sees a blank reply and reports a miss, or a
+     zero-length stream. Every read here falls back to `reasoning_content`.
+  2. Prefill derived from a client's wall clock absorbs decode time and cache hits. A repeated
+     prompt reported 5,577 tok/s in one run of the earlier script -- an artefact of the
+     conversation cache, not a measurement.
+
+Method, which matters more than any figure below:
+  * 12 runs per decode configuration, the first 2 discarded (cold start, cache warm-up)
+  * median with the interquartile range beside it
+  * one variable at a time, a restart between configurations when A/B-ing
   * claim a difference only when it exceeds the IQR
 
-Measured differences smaller than the spread are noise. A documented example: the same
-configuration measured 20 minutes apart gave 71.4 and 66.2 tok/s — 7% from nothing.
+A documented example of why: the same configuration measured 20 minutes apart gave 71.4 and
+66.2 tok/s. That is 7% from nothing -- larger than most of the effects being chased here.
 """
 import argparse, base64, io, json, os, statistics, sys, threading, time
-import urllib.request, urllib.error
+import urllib.request
 
 API_KEY_FILE = os.environ.get("API_KEY_FILE", os.path.expanduser("~/.strata_api_key"))
 PORT = os.environ.get("PORT", "8080")
 BASE = os.environ.get("BASE_URL", f"http://127.0.0.1:{PORT}")
 MODEL = os.environ.get("MODEL_NAME", "swift-1.5-flash-next-abliterated")
 
-
-def load_key():
-    if os.path.exists(API_KEY_FILE):
-        return open(API_KEY_FILE).read().strip()
-    return os.environ.get("STRATA_API_KEY", "")
-
-
-KEY = load_key()
+KEY = (open(API_KEY_FILE).read().strip() if os.path.exists(API_KEY_FILE)
+       else os.environ.get("STRATA_API_KEY", ""))
 
 PROSE = ("Write a detailed technical essay of about 600 words explaining how mixture-of-experts "
          "language models route tokens, why expert caches matter, and how speculative decoding "
@@ -40,21 +56,83 @@ CODE = ("Write a complete, production-quality Python module implementing an LRU 
         "and a usage example at the end.")
 
 
-def _post(payload, timeout=1800):
-    req = urllib.request.Request(
-        f"{BASE}/v1/chat/completions", data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"})
-    return urllib.request.urlopen(req, timeout=timeout)
+# ── plumbing ─────────────────────────────────────────────────────────────────
+def _req(path, payload=None, timeout=1800, request_id=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    h = {"Content-Type": "application/json", "Authorization": f"Bearer {KEY}"}
+    if request_id:
+        h["x-request-id"] = request_id
+    return urllib.request.urlopen(urllib.request.Request(f"{BASE}{path}", data=data, headers=h),
+                                  timeout=timeout)
+
+
+def metrics(timeout=60):
+    with _req("/metrics", timeout=timeout) as r:
+        return json.load(r)
+
+
+def text_of(msg):
+    """A thinking model fills reasoning_content and leaves content empty."""
+    return ((msg.get("content") or "") + " " + (msg.get("reasoning_content") or "")).strip()
 
 
 def chat(prompt, max_tokens, temperature=0.7, timeout=1800):
+    """One completion, with the engine's own per-request accounting attached.
+
+    Matching the /metrics record is the fragile part, and getting it wrong silently produces
+    plausible-but-wrong numbers: an earlier version matched on output token count alone, so ten
+    runs that each produced 512 tokens all matched the *same* older record and reported its
+    decode rate ten times over -- identical "medians" and a prefill figure that was one cached
+    request repeated.
+
+    The engine stamps each record with `time` (a unix timestamp). Snapshot the newest timestamp
+    before the call, send the request with `x-request-id`, and take the record that is both
+    newer than the snapshot and carries our id.
+    """
+    before = 0.0
+    try:
+        rs = metrics().get("requests", [])
+        before = max((e.get("time", 0) for e in rs), default=0.0)
+    except Exception:
+        pass
+
+    rid = f"bench-{time.time_ns()}"
     t0 = time.perf_counter()
-    body = json.loads(_post({"messages": [{"role": "user", "content": prompt}],
-                             "max_tokens": max_tokens, "temperature": temperature},
-                            timeout=timeout).read())
-    dt = (time.perf_counter() - t0) * 1000
-    u = body.get("usage", {})
-    return dt, u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
+    with _req("/v1/chat/completions",
+              {"messages": [{"role": "user", "content": prompt}],
+               "max_tokens": max_tokens, "temperature": temperature},
+              timeout=timeout, request_id=rid) as r:
+        body = json.load(r)
+    wall = (time.perf_counter() - t0) * 1000
+    msg = body["choices"][0]["message"]
+    usage = body.get("usage", {})
+
+    rec = None
+    try:
+        cands = [e for e in metrics().get("requests", []) if e.get("time", 0) > before]
+        # Prefer the record that echoes our request id; otherwise the newest one.
+        for e in sorted(cands, key=lambda x: x.get("time", 0), reverse=True):
+            if e.get("request_id") == rid:
+                rec = e
+                break
+        if rec is None and cands:
+            rec = sorted(cands, key=lambda x: x.get("time", 0), reverse=True)[0]
+    except Exception:
+        pass
+
+    out = {"wall_ms": wall, "text": text_of(msg),
+           "prompt_tokens": usage.get("prompt_tokens", 0),
+           "output_tokens": usage.get("completion_tokens", 0),
+           "finish": body["choices"][0].get("finish_reason")}
+    if rec:
+        for k in ("prompt_ms", "decode_ms", "ttft_ms", "prompt_read", "prompt_total",
+                  "decode_tok_s", "reused_tokens"):
+            if rec.get(k) is not None:
+                out[k] = rec[k]
+        pr, pm = rec.get("prompt_read"), rec.get("prompt_ms")
+        if pr and pm:
+            out["prefill_tok_s"] = round(pr / pm * 1000, 1)
+    return out
 
 
 def filler_prompt(approx_tokens):
@@ -67,36 +145,39 @@ def filler_prompt(approx_tokens):
 
 def stream(prompt, max_tokens, temperature=0.7, timeout=1800):
     t0 = time.perf_counter(); ttft = None; inter = []; last = None; text = ""
-    resp = _post({"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
-                  "temperature": temperature, "stream": True}, timeout=timeout)
-    for line in resp:
-        if not line.startswith(b"data: "):
-            continue
-        pl = line[6:].strip()
-        if pl == b"[DONE]":
-            break
-        try:
-            d = json.loads(pl)["choices"][0].get("delta", {})
-        except Exception:
-            continue
-        # Content only: reasoning deltas would inflate the count for thinking models.
-        delta = d.get("content") or ""
-        if not delta:
-            continue
-        now = time.perf_counter()
-        if ttft is None:
-            ttft = (now - t0) * 1000
-        else:
-            inter.append((now - last) * 1000)
-        text += delta; last = now
-    return dict(ttft_ms=round(ttft or 0, 1), total_ms=round((time.perf_counter() - t0) * 1000, 1),
+    with _req("/v1/chat/completions",
+              {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
+               "temperature": temperature, "stream": True}, timeout=timeout) as resp:
+        for line in resp:
+            if not line.startswith(b"data: "):
+                continue
+            pl = line[6:].strip()
+            if pl == b"[DONE]":
+                break
+            try:
+                d = json.loads(pl)["choices"][0].get("delta", {})
+            except Exception:
+                continue
+            delta = (d.get("content") or "") + (d.get("reasoning_content") or "")
+            if not delta:
+                continue
+            now = time.perf_counter()
+            if ttft is None:
+                ttft = (now - t0) * 1000
+            else:
+                inter.append((now - last) * 1000)
+            text += delta; last = now
+    return dict(ttft_ms=round(ttft or 0, 1),
+                total_ms=round((time.perf_counter() - t0) * 1000, 1),
                 intervals=inter, text=text)
 
 
 def stats(vals, drop=0):
     v = sorted(vals)[drop:]
-    if len(v) < 2:
-        return dict(n=len(v), median=round(v[0], 1) if v else 0)
+    if not v:
+        return dict(n=0, median=0)
+    if len(v) < 4:
+        return dict(n=len(v), median=round(statistics.median(v), 1))
     q = statistics.quantiles(v, n=4)
     return dict(n=len(v), median=round(statistics.median(v), 1),
                 mean=round(statistics.mean(v), 1), iqr=round(q[2] - q[0], 1),
@@ -105,110 +186,132 @@ def stats(vals, drop=0):
 
 # ── sections ─────────────────────────────────────────────────────────────────
 def sec_prefill(R):
-    print("\n== Prefill ==")
+    """Engine-reported prompt_read / prompt_ms. A fresh prompt per row: a repeat is served from
+    the conversation cache and reports a meaningless thousands-of-tok/s figure."""
+    print("\n== Prefill (engine-reported prompt_read / prompt_ms) ==")
     R["prefill"] = []
-    for size in (128, 1024, 4096, 16384, 32768):
-        dt, ptok, _ = chat(filler_prompt(size), 8)
-        e = dict(target=size, prompt_tok=ptok, ms=round(dt, 1), tok_s=round(ptok / dt * 1000, 1))
+    for size in (256, 1024, 4096, 16384, 32768):
+        prompt = filler_prompt(size) + f"\n(seed {time.time_ns()})"
+        r = chat(prompt, 8, temperature=0)
+        e = dict(target=size, prompt_tok=r.get("prompt_total") or r["prompt_tokens"],
+                 read=r.get("prompt_read"), ms=round(r.get("prompt_ms") or 0, 1),
+                 tok_s=r.get("prefill_tok_s"), wall_ms=round(r["wall_ms"], 1))
         R["prefill"].append(e)
-        note = "  <- mostly fixed startup cost" if size <= 128 else ""
-        print(f"  ~{size:>6} -> {ptok:>6} tok  {dt:8.0f} ms  {e['tok_s']:8.1f} tok/s{note}")
+        print(f"  ~{size:>6} -> prompt {e['prompt_tok']:>6} tok, read {e['read']:>6}  "
+              f"{e['ms']:8.0f} ms  {e['tok_s']:8.1f} tok/s   (client wall {e['wall_ms']:.0f} ms)")
 
 
 def sec_ttft(R):
-    print("\n== TTFT (streaming) ==")
+    print("\n== TTFT (engine-reported vs client wall) ==")
     R["ttft"] = []
-    for size in (128, 4096, 16384):
+    for size in (256, 4096, 16384):
         for i in range(2):
-            s = stream(filler_prompt(size), 24)
-            R["ttft"].append(dict(target=size, run=i, ttft_ms=s["ttft_ms"]))
-            print(f"  ~{size:>6} #{i+1}: TTFT {s['ttft_ms']:8.0f} ms")
+            r = chat(filler_prompt(size) + f"\n(seed {time.time_ns()})", 24, temperature=0)
+            e = dict(target=size, run=i, ttft_ms=round(r.get("ttft_ms") or 0, 1),
+                     wall_ms=round(r["wall_ms"], 1))
+            R["ttft"].append(e)
+            print(f"  ~{size:>6} #{i+1}: engine TTFT {e['ttft_ms']:8.0f} ms   "
+                  f"client wall {e['wall_ms']:8.0f} ms")
 
 
 def sec_decode(R, n=12, mt=512):
-    print(f"\n== Decode ({n} runs, first 2 discarded) ==")
+    print(f"\n== Decode ({n} runs each, first 2 discarded) ==")
     R["decode"] = {}
     for label, prompt in (("prose", PROSE), ("code", CODE)):
-        vals = []; tl = []
+        vals, texts = [], []
         for i in range(n):
-            dt, _, ctok = chat(prompt, mt)
-            vals.append(ctok / dt * 1000); tl.append(ctok)
-            if i < 2:
-                print(f"  {label:>5} warm-up #{i+1}: {vals[-1]:6.1f} tok/s (discarded)")
+            r = chat(prompt, mt)
+            v = r.get("decode_tok_s")
+            if v is None and r.get("decode_ms"):
+                v = r["output_tokens"] / r["decode_ms"] * 1000
+            vals.append(v or 0); texts.append(len(r["text"]))
+            tag = "warm-up" if i < 2 else f"#{i-1}"
+            print(f"  {label:>5} {tag:>7}: {vals[-1]:6.1f} tok/s  {r['output_tokens']:>5} tok  "
+                  f"{r.get('decode_ms', 0):8.0f} ms decode")
         R["decode"][label] = stats(vals, drop=2)
-        print(f"  {label:>5}: median {R['decode'][label]['median']:6.1f} tok/s  "
-              f"IQR {R['decode'][label]['iqr']}  n={R['decode'][label]['n']}")
+        R["decode"][label]["chars_median"] = int(statistics.median(texts))
+        s = R["decode"][label]
+        print(f"  {label:>5}: MEDIAN {s['median']:6.1f} tok/s   IQR {s.get('iqr', 0)}   "
+              f"n={s['n']}   ({s['chars_median']} chars)")
 
 
 def sec_reuse(R):
-    print("\n== Prompt reuse ==")
+    print("\n== Prompt reuse (identical prompt, three sends) ==")
     R["reuse"] = []
-    p = filler_prompt(4096)
+    p = filler_prompt(4096)          # deliberately identical every time
     for i in range(3):
-        dt, ptok, _ = chat(p, 32)
-        R["reuse"].append(dict(run=i, ms=round(dt, 1), prompt_tok=ptok))
-        print(f"  same {ptok}-tok prompt #{i+1}: {dt:8.0f} ms")
+        r = chat(p, 32, temperature=0)
+        e = dict(run=i, ms=round(r.get("prompt_ms") or 0, 1),
+                 prompt_tok=r.get("prompt_total"), read=r.get("prompt_read"),
+                 reused=r.get("reused_tokens"), wall_ms=round(r["wall_ms"], 1))
+        R["reuse"].append(e)
+        print(f"  #{i+1}: prompt {e['prompt_tok']} tok, read {e['read']}, reused {e['reused']}  "
+              f"prompt_ms {e['ms']:8.0f}   (wall {e['wall_ms']:.0f} ms)")
 
 
 def sec_stream(R):
-    print("\n== Streaming intervals (2048 out) ==")
+    print("\n== Streaming intervals ==")
     s = stream(PROSE, 2048)
     iv = s["intervals"]
     if not iv:
-        R["stream"] = dict(error="no content deltas")
-        print("  no content deltas — the reply may be all reasoning")
+        R["stream"] = dict(error="no deltas")
+        print("  no deltas")
         return
     v = sorted(iv); n = len(v)
     R["stream"] = dict(chunks=n, ttft_ms=s["ttft_ms"], total_s=round(s["total_ms"] / 1000, 2),
                        p50=round(statistics.median(iv), 1), p95=round(v[int(n * .95)], 1),
                        mean=round(statistics.mean(iv), 1), chars=len(s["text"]))
     print(f"  chunks={n}  TTFT={s['ttft_ms']:.0f}ms  p50={R['stream']['p50']:.0f}ms  "
-          f"p95={R['stream']['p95']:.0f}ms  total={R['stream']['total_s']}s")
+          f"p95={R['stream']['p95']:.0f}ms  total={R['stream']['total_s']}s  "
+          f"({R['stream']['chars']} chars)")
 
 
 def sec_concurrency(R, mt=512):
-    print("\n== Concurrency sweep ==")
+    print("\n== Concurrency ==")
     R["concurrency"] = []
     for conc in (1, 2, 4):
         out = []
         def one():
-            dt, _, ctok = chat(PROSE, mt)
-            out.append((ctok, dt))
+            out.append(chat(PROSE, mt))
         t0 = time.perf_counter()
         ths = [threading.Thread(target=one) for _ in range(conc)]
         [t.start() for t in ths]; [t.join() for t in ths]
         wall = (time.perf_counter() - t0) * 1000
-        per = [c / d * 1000 for c, d in out]
-        e = dict(conc=conc, wall_ms=round(wall, 1), agg_tok_s=round(sum(c for c, _ in out) / wall * 1000, 1),
+        toks = sum(r["output_tokens"] for r in out)
+        per = [r.get("decode_tok_s") or 0 for r in out]
+        e = dict(conc=conc, wall_ms=round(wall, 1), tokens=toks,
+                 agg_tok_s=round(toks / wall * 1000, 1),
                  per_req=round(statistics.mean(per), 1), runs=[round(x, 1) for x in per])
         R["concurrency"].append(e)
-        print(f"  {conc} in flight: wall {wall/1000:6.1f}s  aggregate {e['agg_tok_s']:6.1f} tok/s  "
-              f"per request {e['per_req']:5.1f} tok/s")
-        time.sleep(2)
+        print(f"  {conc} in flight: wall {wall/1000:6.1f}s  {toks:>5} tok  "
+              f"aggregate {e['agg_tok_s']:6.1f} tok/s  per request {e['per_req']:5.1f} tok/s")
+        time.sleep(3)
 
 
-def sec_needle(R, depths=(8192, 32768, 131072)):
-    print("\n== Needle in a haystack ==")
+def sec_needle(R, depths=(8192, 32768, 131072, 262144)):
+    print("\n== Needle retrieval ==")
     R["needle"] = []
-    needle = "The secret access code is MANTIS-7742-QQ."
     for size in depths:
         filler = ("The following is archival meeting transcript material for reference purposes only. "
                   "It contains routine operational notes and carries no action items. ") * (size // 25)
         half = len(filler) // 2
-        doc = filler[:half] + "\n\n" + needle + "\n\n" + filler[half:]
+        doc = filler[:half] + "\n\nThe secret access code is MANTIS-7742-QQ.\n\n" + filler[half:]
         prompt = ("[DOC]\n" + doc + "\n[/DOC]\n\nThe document above contains one access code. "
                   "Quote it exactly, character for character, and nothing else.")
-        t0 = time.perf_counter()
-        body = json.loads(_post({"messages": [{"role": "user", "content": prompt}],
-                                 "max_tokens": 200, "temperature": 0.0}, timeout=1800).read())
-        dt = time.perf_counter() - t0
-        m = body["choices"][0]["message"]
-        # A reasoning model may put the answer in either field; check both before declaring a miss.
-        answer = ((m.get("content") or "") + " " + (m.get("reasoning_content") or "")).strip()
-        found = "MANTIS-7742" in answer.upper()
-        ptok = body.get("usage", {}).get("prompt_tokens", 0)
-        R["needle"].append(dict(target=size, prompt_tok=ptok, ms=round(dt * 1000, 1), found=found))
-        print(f"  ~{size:>7} (actual {ptok:>7}): {'found' if found else 'MISSED'}  {dt:6.1f}s")
+        try:
+            r = chat(prompt, 400, temperature=0)
+        except Exception as e:
+            print(f"  ~{size:>7}: request failed: {e}")
+            R["needle"].append(dict(target=size, error=str(e)))
+            continue
+        found = "MANTIS-7742" in r["text"].upper()
+        e = dict(target=size, prompt_tok=r.get("prompt_total"), found=found,
+                 ms=round(r.get("prompt_ms") or r["wall_ms"], 1), reply=r["text"][:160])
+        R["needle"].append(e)
+        print(f"  ~{size:>7} (actual {e['prompt_tok']:>7}): "
+              f"{'FOUND' if found else 'MISSED'}  prompt {e['ms']:8.0f} ms")
+        if not found:
+            print(f"      reply: {e['reply']!r}")
 
 
 def sec_vision(R):
@@ -225,17 +328,19 @@ def sec_vision(R):
         d.ellipse([520, 150, 690, 240], fill="blue")
         buf = io.BytesIO(); img.save(buf, "PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
-        body = json.loads(_post({"messages": [{"role": "user", "content": [
-            {"type": "text", "text": "What text and shapes do you see? Be literal and exact."},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}],
-            "max_tokens": 300, "temperature": 0.2}, timeout=600).read())
-        ans = body["choices"][0]["message"].get("content") or ""
+        with _req("/v1/chat/completions",
+                  {"messages": [{"role": "user", "content": [
+                      {"type": "text", "text": "What text and shapes do you see? Be literal and exact."},
+                      {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}],
+                   "max_tokens": 300, "temperature": 0.2}, timeout=600) as r:
+            body = json.load(r)
+        ans = text_of(body["choices"][0]["message"])
         ok = "STRATA" in ans.upper() and "512" in ans
-        R["vision"] = dict(ok=ok, answer=ans[:400])
-        print(f"  {'ok' if ok else 'FAIL'}  cell text read correctly: {ok}")
-        print(f"  {ans[:160]!r}")
+        R["vision"] = dict(ok=ok, answer=ans[:300])
+        print(f"  {'ok' if ok else 'FAIL'} -- read the card text: {ok}")
+        print(f"  {ans[:120]!r}")
     except ImportError:
-        print("  skipped: Pillow is not installed (pip install pillow)")
+        print("  skipped: pip install pillow")
         R["vision"] = dict(skipped="no pillow")
     except Exception as e:
         print(f"  FAIL: {e}")
@@ -252,33 +357,28 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", action="append", choices=sorted(SECTIONS),
                     help="run only this section (repeatable)")
-    ap.add_argument("--json", help="write the raw results here")
+    ap.add_argument("--json", default="/tmp/strata-bench.json", help="where to write raw results")
     ap.add_argument("-n", type=int, default=12, help="decode runs (default 12, first 2 discarded)")
     a = ap.parse_args()
 
     try:
-        meta = json.loads(urllib.request.urlopen(
-            urllib.request.Request(f"{BASE}/v1/models",
-                                   headers={"Authorization": f"Bearer {KEY}"}), timeout=30).read())
-        d = meta["data"][0]
-        print(f"model {d['id']}  context {d['meta']['n_ctx']}  input {d['architecture']['input_modalities']}")
+        with _req("/v1/models", timeout=30) as r:
+            d = json.load(r)["data"][0]
+        print(f"model {d['id']}  context {d['meta']['n_ctx']}  "
+              f"input {d['architecture']['input_modalities']}")
     except Exception as e:
-        sys.exit(f"cannot reach {BASE} — is the server up and is the API key right?\n  {e}")
+        sys.exit(f"cannot reach {BASE} -- is the server up and the key right?\n  {e}")
 
     R = {}
     for name in (a.only or list(SECTIONS)):
         try:
-            if name == "decode":
-                sec_decode(R, n=a.n)
-            else:
-                SECTIONS[name](R)
+            sec_decode(R, n=a.n) if name == "decode" else SECTIONS[name](R)
         except Exception as e:
             print(f"  section {name} failed: {e}")
             R[name] = dict(error=str(e))
 
-    out = a.json or "/tmp/strata-bench.json"
-    json.dump(R, open(out, "w"), indent=1, ensure_ascii=False)
-    print(f"\nraw results -> {out}")
+    json.dump(R, open(a.json, "w"), indent=1, ensure_ascii=False)
+    print(f"\nraw results -> {a.json}")
 
 
 if __name__ == "__main__":
