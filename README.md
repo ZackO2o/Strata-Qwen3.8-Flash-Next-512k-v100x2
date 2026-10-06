@@ -356,8 +356,8 @@ repository that is distribution-specific.
 ## Quick start
 
 ```bash
-git clone https://github.com/ZackO2o/v100-qwen38-flashnext-512k.git
-cd v100-qwen38-flashnext-512k
+git clone https://github.com/ZackO2o/Strata-Qwen3.8-Flash-Next-512k-v100x2.git
+cd Strata-Qwen3.8-Flash-Next-512k-v100x2
 cp scripts/local.sh.example scripts/local.sh   # edit the paths
 ./start.sh
 ```
