@@ -1,0 +1,21 @@
+# Machine-specific paths and key material — never commit these
+scripts/local.sh
+*.key
+*_api_key
+
+# Build output and downloaded artifacts
+build/
+build-vision/
+configs/*.local.json
+models/
+packs/
+
+# Benchmark output
+*-bench.json
+bench_results*.json
+
+# Editors / OS
+.DS_Store
+*.swp
+__pycache__/
+*.py[cod]

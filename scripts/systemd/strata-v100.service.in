@@ -1,0 +1,40 @@
+[Unit]
+Description=Strata Qwen3.8-Flash-Next 125B MoE (abliterated IQ3_S) on dual Tesla V100
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__STRATA_DIR__
+# systemd does not inherit your shell: the launcher needs these to spawn the engine, and the
+# config's lib_dirs/env carry them further down. See docs/BUILD_NOTES.md.
+Environment=PATH=__CUDA_HOME__/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=__CUDA_HOME__/lib64
+Environment=STRATA_GGUF_PY=__LLAMA_DIR__/gguf-py
+Environment=PYTHONPATH=__LLAMA_DIR__/gguf-py
+
+# Sweeping stragglers before start takes load time from ~200 s to ~50 s. A pkill that matches
+# nothing exits 1 and systemd logs status=1/FAILURE — that is expected, not an error.
+ExecStartPre=-/usr/bin/pkill -9 -f serve.server
+ExecStartPre=-/usr/bin/pkill -9 -f strata-vision
+ExecStartPre=-/usr/bin/pkill -9 -f 'build/strata --serve'
+ExecStartPre=/bin/sleep 3
+
+ExecStart=/usr/bin/python3 -m serve.server --engine strata --config __CONFIG__ --port __PORT__ --host __HOST__
+
+ExecStop=-/usr/bin/pkill -9 -f serve.server
+ExecStop=-/usr/bin/pkill -9 -f strata-vision
+ExecStop=-/usr/bin/pkill -9 -f 'build/strata --serve'
+
+Restart=always
+RestartSec=20
+TimeoutStartSec=900
+TimeoutStopSec=30
+# This is what takes the strata-vision child down with the engine.
+KillMode=control-group
+
+StandardOutput=append:__LOG__
+StandardError=append:__LOG__
+
+[Install]
+WantedBy=multi-user.target

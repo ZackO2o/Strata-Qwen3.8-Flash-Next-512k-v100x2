@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# This machine's paths and nothing else. Copy to local.sh and edit.
+# local.sh is git-ignored — put keys and hostnames there, never in config.sh.
+
+# MODEL_DIR=/data/models/qwen38-flash-next
+# STRATA_DIR=/data/build/strata-v100
+# UPSTREAM_DIR=/data/build/strata
+# LLAMA_DIR=/data/build/llama.cpp
+# DATA_DIR=/data/build/Strata-data
+# CONV_CACHE_DIR=/data/strata-conv-cache
+
+# CUDA 12.x — CUDA 13 removed sm_70. See docs/BUILD_NOTES.md.
+# export PATH=/usr/local/cuda-12.4/bin:$PATH
+# export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
+
+# Overrides for anything in config.sh, e.g. if you have more or less host RAM:
+# KV_RESIDENT=16384
+# LAYER_SPLIT=24

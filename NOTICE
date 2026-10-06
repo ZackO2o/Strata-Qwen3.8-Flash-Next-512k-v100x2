@@ -1,0 +1,44 @@
+This product includes software developed by third parties.
+
+------------------------------------------------------------------------------
+Strata -- https://github.com/Niko1221/Strata
+Copyright (c) Niko1221 and contributors. Apache License 2.0.
+
+This repository does not redistribute Strata. `patches/`, when non-empty, contains changes
+intended to be applied to a Strata checkout; the code those changes modify or quote as context
+remains under Strata's license.
+
+------------------------------------------------------------------------------
+jmnargi/Strata-V100 -- https://github.com/jmnargi/Strata-V100
+A fork of Strata. Apache License 2.0, retaining the upstream notices.
+
+This repository does not redistribute the fork. Documented builds come from a checkout of it at
+the revision recorded in the README.
+
+------------------------------------------------------------------------------
+llama.cpp -- https://github.com/ggml-org/llama.cpp
+Copyright (c) 2023-2024 The ggml authors. MIT License.
+
+Used as a build dependency and as the source of the GGUF tooling. Not redistributed here.
+
+------------------------------------------------------------------------------
+Qwen3.8-Flash-Next -- Qwen / Alibaba
+
+The base model, the `Swift-1.5` `IQ3_S` abliterated derivative used in these measurements, and
+the vision encoder are downloaded at run time and are not part of this repository. Each carries
+its own license, and a derivative's terms can differ from the base model's. Nothing in this
+repository grants any right to the model weights.
+
+------------------------------------------------------------------------------
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+Apache License 2.0.
+
+Referenced for documentation structure and as a methodological model. No code is copied from it.
+
+------------------------------------------------------------------------------
+jiangrun0213/strata-v100-notes -- https://github.com/jiangrun0213/strata-v100-notes
+
+Their benchmark script is executed against this configuration to produce the comparison in
+docs/COMPARISON.md. It is not redistributed here; the comparison document records the exact
+modifications made when running it (port and authorization header only).
