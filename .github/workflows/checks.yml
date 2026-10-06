@@ -1,0 +1,37 @@
+name: checks
+
+on: [push, pull_request]
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax
+        run: |
+          for f in start.sh stop.sh switch.sh scripts/*.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: python syntax
+        run: |
+          python3 -m py_compile tools/*.py
+
+      - name: configs generate valid JSON
+        run: |
+          mkdir -p /tmp/ci-data
+          MODEL_DIR=/tmp/ci-data STRATA_DIR=/tmp/ci-data UPSTREAM_DIR=/tmp/ci-data \
+          LLAMA_DIR=/tmp/ci-data DATA_DIR=/tmp/ci-data CONV_CACHE_DIR=/tmp/ci-data \
+          CUDA_HOME=/usr/local/cuda SERVICE_NAME=ci \
+          API_KEY_FILE=/dev/null EXPERT_PROFILE=/tmp/ci-data/expert-profile.bin \
+          bash scripts/write-configs.sh
+          python3 - <<'EOF'
+          import json
+          for p in ("configs/512k.json", "configs/256k.json"):
+              c = json.load(open(p))
+              assert c["args"].count("--max-context") == 1, p
+              assert c["env"]["STRATA_GGUF_PY"], p
+              assert c["lib_dirs"], p
+          print("configs ok")
+          EOF
