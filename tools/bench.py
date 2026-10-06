@@ -3,6 +3,7 @@
 
     python3 tools/bench.py                    # everything
     python3 tools/bench.py --only decode      # one section
+    python3 tools/bench.py --lang zh          # Chinese prose/code prompts (CJK draft path)
     PORT=8080 python3 tools/bench.py --json out.json
 
 Why the engine's numbers and not the client's:
@@ -54,6 +55,23 @@ PROSE = ("Write a detailed technical essay of about 600 words explaining how mix
 CODE = ("Write a complete, production-quality Python module implementing an LRU cache with TTL "
         "expiry, thread safety, statistics, and a decorator interface. Include full type hints "
         "and a usage example at the end.")
+
+# The same two tasks in Chinese. Not translations to be compared against the English pair as if
+# they were the same measurement -- they are not, and the decode rate differs for a real reason:
+# this model's MTP draft vocabulary only covers a subset of Han tokens unless `--add cjk` was run,
+# and Chinese drafts far less well when it was not. See tools/draft_vocab_stats.py. Running both
+# pairs is how that effect is measured rather than assumed.
+PROSE_ZH = ("写一篇约一千字的技术散文，详细解释混合专家（MoE）语言模型如何路由 token、"
+            "专家缓存为什么重要、以及投机解码与稀疏激活的相互作用。不要用要点列表，"
+            "只写流畅的散文。")
+
+CODE_ZH = ("写一个完整的、可用于生产环境的 Python 模块，实现一个带 TTL 过期、线程安全、"
+           "统计功能和装饰器接口的 LRU 缓存。包含完整的类型标注，并在结尾给一个使用示例。")
+
+LANG_PAIRS = {
+    "en": (PROSE, CODE),
+    "zh": (PROSE_ZH, CODE_ZH),
+}
 
 
 # ── plumbing ─────────────────────────────────────────────────────────────────
@@ -214,10 +232,11 @@ def sec_ttft(R):
                   f"client wall {e['wall_ms']:8.0f} ms")
 
 
-def sec_decode(R, n=12, mt=512):
-    print(f"\n== Decode ({n} runs each, first 2 discarded) ==")
+def sec_decode(R, n=12, mt=512, lang="en"):
+    prose, code = LANG_PAIRS[lang]
+    print(f"\n== Decode ({n} runs each, first 2 discarded, lang={lang}) ==")
     R["decode"] = {}
-    for label, prompt in (("prose", PROSE), ("code", CODE)):
+    for label, prompt in (("prose", prose), ("code", code)):
         vals, texts = [], []
         for i in range(n):
             r = chat(prompt, mt)
@@ -266,13 +285,13 @@ def sec_stream(R):
           f"({R['stream']['chars']} chars)")
 
 
-def sec_concurrency(R, mt=512):
-    print("\n== Concurrency ==")
+def sec_concurrency(R, mt=512, lang="en"):
+    print(f"\n== Concurrency (lang={lang}) ==")
     R["concurrency"] = []
     for conc in (1, 2, 4):
         out = []
         def one():
-            out.append(chat(PROSE, mt))
+            out.append(chat(LANG_PAIRS[lang][0], mt))
         t0 = time.perf_counter()
         ths = [threading.Thread(target=one) for _ in range(conc)]
         [t.start() for t in ths]; [t.join() for t in ths]
@@ -359,6 +378,9 @@ def main():
                     help="run only this section (repeatable)")
     ap.add_argument("--json", default="/tmp/strata-bench.json", help="where to write raw results")
     ap.add_argument("-n", type=int, default=12, help="decode runs (default 12, first 2 discarded)")
+    ap.add_argument("--lang", default="en", choices=sorted(LANG_PAIRS),
+                    help="prompt language for the prose/code and concurrency sections "
+                         "(default en; zh measures the CJK draft-vocabulary path)")
     a = ap.parse_args()
 
     try:
@@ -372,7 +394,12 @@ def main():
     R = {}
     for name in (a.only or list(SECTIONS)):
         try:
-            sec_decode(R, n=a.n) if name == "decode" else SECTIONS[name](R)
+            if name == "decode":
+                sec_decode(R, n=a.n, lang=a.lang)
+            elif name == "concurrency":
+                sec_concurrency(R, lang=a.lang)
+            else:
+                SECTIONS[name](R)
         except Exception as e:
             print(f"  section {name} failed: {e}")
             R[name] = dict(error=str(e))

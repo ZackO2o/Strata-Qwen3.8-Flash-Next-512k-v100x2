@@ -1,6 +1,100 @@
 # Changelog
 
+## v1.2 — the decode numbers were a window, not a property
+
+v1.1 published **74.1 tok/s prose / 100.0 tok/s code** and attributed the code figure to
+`--ple-io mmap`. Both need amending, and the more useful amendment is the second one: the spread
+across sessions on this machine is larger than every tuning effect this repository documents.
+
+**What the numbers actually do.** On one service, one configuration, one prompt, across a single
+log:
+
+| Output length | runs | median | best |
+| --: | --: | --: | --: |
+| <10 tok | 231 | 59.0 | 114.2 |
+| 50–149 tok | 23 | 85.3 | 112.2 |
+| 150–299 tok | 78 | 91.1 | 112.2 |
+| 512+ tok | 517 | 77.1 | **127.0** |
+
+Across one continuous service lifetime the same 512-token request ran **86–90 tok/s in the middle
+segments and 70.8 at the end**. After a clean restart, 12 runs of the code prompt gave
+**69.5, 70.3, 70.3, 70.3, 69.0, 68.7, 72.8, 71.3, 65.7, 73.7** — median ~70.3, not 100.
+
+**So the decode figures belong in a band, not on a point.** Treat this configuration as
+**65–105 tok/s on 512-token outputs**, with ~70 the number to expect from a cold start and 100+
+reachable but not repeatable on demand. The published 100.0 was real when measured and is not
+reproducible now, which makes it the wrong thing to have put in the headline.
+
+**The `--ple-io` attribution is withdrawn.** The three-arm comparison (direct 73.0/72.6, ram
+75.8/98.8, mmap 74.1/100.0) was measured at three different points in this service's lifetime,
+**not interleaved**. Given the spread below, the ordering between those arms cannot be separated
+from the drift between their measurement windows. What survives:
+
+- **`ram` is still wrong**, for a reason that is not about speed: it pins 26.8 GiB, drives
+  `MemFree` to 603 MB, and forces the kernel to reclaim the process's own pages (`VmSwap` 1.45
+  GiB, `allocstall` 172k, `compact_stall` 325k). Those costs are structural and timing-independent.
+- **`mmap` over `direct` is still defensible** — `direct` reads the 28.8 GiB table unbuffered from
+  SSD on every token, `mmap` lets the kernel keep hot rows. But the size of the win is unmeasured,
+  and **the honest statement is "prefer `mmap`", not "+37%"**.
+
+**Where the 2.35× lives, and where it does not.** The engine's own per-request accounting isolates
+it. Eight 512-token requests from one log, normalised by the engine's own `drafts_offered`:
+
+| decode ms | tok/s | drafts offered | accepted | accept rate | ms/forward |
+| --: | --: | --: | --: | --: | --: |
+| 6,127 | 83.6 | 325 | 267 | 82.2% | **75.4** |
+| 6,750 | 75.8 | 283 | 236 | 83.4% | 95.4 |
+| 7,337 | 69.8 | 227 | 190 | 83.7% | 129.3 |
+| 11,017 | 46.5 | 249 | 207 | 83.1% | **177.0** |
+
+**Acceptance rate is flat at 82–83% and work per forward is flat — the length of a forward itself
+varies 2.35×.** That is what the user-visible number tracks. Ruled out by measurement, one at a
+time:
+
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| Chinese prompt is slower | EN/ZH interleaved, same process | 68.8 vs 67.7 — no |
+| Draft acceptance collapses | engine counters, EN vs ZH | 78.1% vs 77.2% — no |
+| Expert cache degrades | log line, both languages | 99.8% vs 99.9% — no |
+| Conversation cache fills up | clean restart, slots empty | still 61–84 — no |
+| GPU throttling | `nvidia-smi` under load | 44–47 °C, no throttle — no |
+| PLE table not resident | pre-warmed all 26.82 GiB | no change — no |
+| NUMA placement | `numactl --cpunodebind=0` | **worse** (49–69) — no |
+
+The last two are worth stating plainly because both are the intuitive fix and both failed. The
+engine's `--pool-affinity` offers only `all` / `auto` / `p-cores` — there is **no "stay on one NUMA
+node" mode** — and pinning the whole service to node 0 made it slower, not faster.
+
+**Unresolved.** Why a forward takes 75 ms or 177 ms is not explained. The engine reports
+`hit_rate 0.999` and `pcie_share 0.0` throughout. Remaining candidates are QPI contention between
+the sockets (GPU0↔GPU1 is `SYS`, not P2P) and PCIe Gen 3 ×16 saturation — both consistent with
+these measurements, neither isolated. **"Not yet explained" is more accurate than picking one.**
+
+**Chinese prompts: the gap was real, the conclusion was wrong.** A first pass reported Chinese code
+at 72.5 against English 100.0, i.e. −27.5%. That was confounded — the two runs sat at different
+points in the service's lifetime against different cache states. Re-run interleaved in one process:
+
+```
+67.2  65.8  68.8  65.3  70.2  71.5  68.2  67.7  70.4  70.3
+ EN1   ZH1   EN2   ZH2   EN3   ZH3   EN4   ZH4   EN5   ZH5
+```
+
+No systematic difference; both sit in the same band. **The −27.5% is withdrawn.** What is real is
+that this repository had no Chinese prompts at all, and `tools/bench.py --lang zh` now supplies
+them (`en` remains the default).
+
+**Method change that follows from this.** Every A/B in this repository must **interleave its arms
+within one service lifetime** rather than running arm A to completion and then arm B. The v1.0 and
+v1.1 tables do not do this and should be read with that in mind. Recorded rather than quietly
+repaired.
+
+---
+
 ## v1.1 — the PLE I/O arm, and a concurrency claim withdrawn
+
+> **Amended by v1.2.** The decode figures and the `--ple-io` attribution in this entry are
+> withdrawn; see above. The concurrency correction and the negative sweep results stand, with the
+> caveat that the sweep arms were not interleaved either.
 
 Adds the one memory-side lever this configuration had left, and corrects an earlier concurrency
 number that flattered the engine. The engine version and the hardware are unchanged; every figure

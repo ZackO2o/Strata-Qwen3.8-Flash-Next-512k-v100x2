@@ -106,48 +106,100 @@ Costs ~2 GiB of host RAM per card.
 The 52 ms figure is the one users feel: a repeat prompt costs essentially nothing. The disk tier
 is what carries that across a process restart, where an in-process cache cannot.
 
-### `--ple-io mmap` — the RAM-side lever, and why not `ram`
+### `--ple-io mmap` — why it is preferred, and why the number is gone
 
-The 28.8 GiB shard 2 is the n-gram/PLE table, read once per token. `--ple-io` decides how that
-read happens, and it turned out to be the only memory-side setting with room left on this
-configuration:
+The 28.8 GiB shard 2 is the n-gram/PLE table, read once per token. `--ple-io` decides how that read
+happens. `direct` does unbuffered SSD reads and deliberately keeps the table out of RAM and out of
+the page cache — the engine's own help says so. `mmap` maps it into the page cache without locking
+it, so rows in use stay resident and the rest remains reclaimable.
 
-| `--ple-io` | Prose | Code | `VmLck` | `VmSwap` | `MemAvailable` |
-| --- | --: | --: | --: | --: | --: |
-| `direct` (engine default) | 73.0 | 72.6 | 0 | 0 | high |
-| `ram` | 75.8 | 98.8 | **26.8 GiB** | 0.95 GiB | 34.5 GiB |
-| **`mmap`** | **74.1** | **100.0** | **0** | **0** | **59.5–64 GiB** |
+**This section previously published a three-arm table — `direct` 73.0/72.6, `ram` 75.8/98.8,
+`mmap` 74.1/100.0 — and that table is withdrawn.** The arms were measured at three different points
+in one service's lifetime, not interleaved. On this machine the drift between measurement windows
+is **2.35×** on the same configuration and prompt, which is larger than the effect the table
+claimed. Whatever ordering those arms have cannot be separated from when they happened to run.
 
-`direct` does unbuffered SSD reads and deliberately keeps the table out of RAM and out of the
-page cache — the engine's own help says so. Reading from an SSD on every token is what costs the
-code path its ~27 tok/s; prose reuses rows heavily and barely notices.
+**What is still defensible, in order of confidence:**
 
-`ram` is the intuitive fix — map the table and lock the whole thing — and it works, right up
-until the memory accounting. Pinning 26.8 GiB drives `MemFree` to **603 MB**; the kernel then
-starts reclaiming the process's *own* anonymous pages, and the counters say so:
+1. **`ram` is wrong.** Not because of its decode rate — because locking 26.8 GiB drives `MemFree`
+   to **603 MB**, and the kernel then reclaims the process's *own* anonymous pages:
 
-```
-VmSwap       1.45 GiB      allocstall_normal   172,228
-pswpin       309,450        compact_stall       324,567
-pgmajfault    73,578
-```
+   ```
+   VmSwap       1.45 GiB      allocstall_normal   172,228
+   pswpin       309,450        compact_stall       324,567
+   pgmajfault    73,578
+   ```
 
-Those stalls are worth understanding because they lie about their cause: during a stall the
-engine's own decode rate stays normal, and a client sees tens of seconds of wall clock with no
-slowdown recorded on the device. **The stall is page reclaim, not compute.**
+   Those stalls lie about their cause: the engine's own decode rate stays normal during one, and a
+   client sees tens of seconds of wall clock with nothing slow recorded on the device. **The stall
+   is page reclaim, not compute.** These costs are structural — they do not depend on when the
+   measurement ran.
 
-`mmap` gets the same class of decode improvement without any of that. It maps the table into the
-page cache and does not lock it, so the rows that are being used stay resident and the rest is
-reclaimable under pressure. `VmRSS` splits as `Anon 52.3 GiB + File 29.1 GiB` — the table is
-counted as clean file pages, which the kernel can drop for free instead of swapping.
+2. **`mmap` over `direct` is preferred**, because `direct` pays an SSD read on every token's table
+   lookup and `mmap` lets the kernel avoid most of them. The mechanism is clear; **the magnitude is
+   not measured**, so no percentage is quoted.
 
-**Net: `mmap` ≈ `ram` on decode, ±25 GiB on memory, and it removes the stalls entirely.** The
-repository ships `PLE_IO=mmap`. Verify the mode took effect with:
+`mmap` also costs nothing in memory: `VmLck 0`, `VmSwap 0`, and `VmRSS` splits as
+`Anon 52.3 GiB + File 29.1 GiB` — the table is counted as clean file pages the kernel can drop for
+free. Verify the mode took effect with:
 
 ```bash
 grep -E "VmRSS|VmLck|VmSwap" /proc/$(pgrep -f "build/strata --serve" | head -1)/status
 # mmap: VmLck 0 kB, VmSwap 0 kB   -- ram: VmLck ~26.8 GB
 ```
+
+### Measurement drift — the largest effect on this machine
+
+Recorded here because it dominates everything else in this file, and because it is the reason the
+tables in this document are weaker than they appear.
+
+On one service, one configuration, one prompt, across one log:
+
+| Output length | runs | median | best |
+| --: | --: | --: | --: |
+| <10 tok | 231 | 59.0 | 114.2 |
+| 150–299 tok | 78 | 91.1 | 112.2 |
+| 512+ tok | 517 | 77.1 | **127.0** |
+
+The same 512-token request ran at segment means of **86–90 tok/s mid-lifetime and 70.8 at the end**.
+After a clean restart it settled at ~70.3 (twelve runs: `69.5 70.3 70.3 70.3 69.0 68.7 72.8 71.3
+65.7 73.7`).
+
+Normalising by the engine's own `drafts_offered` counter shows where it lives — **not** in draft
+acceptance:
+
+| decode ms | tok/s | accept rate | ms/forward |
+| --: | --: | --: | --: |
+| 6,127 | 83.6 | 82.2% | **75.4** |
+| 6,750 | 75.8 | 83.4% | 95.4 |
+| 7,337 | 69.8 | 83.7% | 129.3 |
+| 11,017 | 46.5 | 83.1% | **177.0** |
+
+Acceptance is flat at 82–83%, work per forward is flat, and **the duration of a single forward
+varies 2.35×**. Implemented as a caveat throughout this file: **any A/B on this machine must
+interleave its arms inside one service lifetime** (A, B, A, B), never run arm A to completion and
+then arm B.
+
+Candidate causes, each tested and rejected:
+
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| Chinese prompt is slower | EN/ZH interleaved, one process | 68.8 vs 67.7 — no |
+| Draft acceptance collapses | engine counters, EN vs ZH | 78.1% vs 77.2% — no |
+| Expert cache degrades | log line, both languages | 99.8% vs 99.9% — no |
+| Conversation cache fills up | clean restart, slots empty | still 61–84 — no |
+| GPU throttling | `nvidia-smi` under load | 44–47 °C, no throttle — no |
+| PLE table not resident | pre-warmed all 26.82 GiB | no change — no |
+| NUMA placement | `numactl --cpunodebind=0` | **worse** (49–69) — no |
+
+The last two deserve the emphasis because both are the intuitive fix and both failed.
+**`--pool-affinity` has no "one NUMA node" mode** — only `all` / `auto` / `p-cores` — so the
+obvious way to stop workers crossing QPI does not exist, and pinning the whole service to node 0
+was slower.
+
+**Not identified.** Remaining candidates: QPI contention between the sockets (GPU0↔GPU1 is `SYS`,
+not P2P) and PCIe Gen 3 ×16 saturation. Both are consistent with what is measured; neither is
+isolated.
 
 ### Kernel `vm.*` tuning — measured, and a loss here
 
