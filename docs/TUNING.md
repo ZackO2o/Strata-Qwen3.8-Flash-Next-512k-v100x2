@@ -3,18 +3,64 @@
 What we tried, what it did, what we concluded. **The negative results are the useful part** —
 they are what stops the next person spending a session on them.
 
-Method, and it is not optional on this hardware: 12 runs per configuration, the first 2
-discarded for cold-start and cache warm-up, **median reported with the IQR beside it**. One
-variable changed at a time, restart between configurations.
+Method, and it is not optional on this hardware: **interleave the arms you are comparing** (A, B,
+A, B — never A to completion then B), 12 runs per arm, the first 2 discarded for cold-start and
+cache warm-up, **median reported, with a reproduction round before the number is treated as a
+baseline**. One variable changed at a time, restart between configurations.
 
-The IQR is the point. The same configuration measured 20 minutes apart gave 71.4 and 66.2 tok/s.
-On the final configuration the prose IQR is **4.5 tok/s on a 64.4 median** — 7%. Any effect
-smaller than the IQR is noise, and an earlier version of this document drew conclusions from
-5-run samples that a 12-run sample reversed.
+Two reasons the protocol is this strict, both learned the hard way. First, the same configuration
+measured twice gave 71.4 and 66.2 tok/s — 8% — so any effect smaller than the spread is noise, and
+an earlier version of this document drew conclusions from 5-run samples that a 12-run sample
+reversed. Second, and worse: comparing arms that were *not* interleaved lets the difference between
+two runs of the machine be read as the difference between two configurations. **Several tables in
+this file predate that rule and are marked as withdrawn where it matters.**
+
+Reproduction is the other half. Once a configuration has a stable median, re-running it later
+should land within ~5%; the current interleaved three-content baseline does (`84.8 / 80.8` for
+Chinese prose, `82.8 / 79.3` for code, `70.9 / 68.3` for English prose, two rounds, same ordering).
 
 ---
 
 ## Winners
+
+### Turn on the engine's own profiler before tuning anything
+
+**The single highest-value thing in this document.** Strata 0.1.40 (and up) can break down its own
+decode loop, and until you have that breakdown you are guessing about where time goes. Set the two
+environment variables on the service and every request logs a line:
+
+```bash
+# systemd drop-in — do not edit the main unit
+mkdir -p /etc/systemd/system/strata-v100.service.d
+printf '[Service]\nEnvironment=STRATA_DECODE_TIMING=1\nEnvironment=STRATA_VERIFY_PROFILE=1\n' \
+  > /etc/systemd/system/strata-v100.service.d/10-profiler.conf
+systemctl daemon-reload && systemctl restart strata-v100
+# then, after a few requests:
+grep -a "decode timing" /root/engine-server.log | tail
+```
+
+Output, one line per request:
+
+```
+strata decode timing: 281 windows, avg T 2.04, 1.82 tokens/window, 25.80 ms/window
+  = verify 23.56 (GPU-reach wait 0.00 + per-layer host 0.00 [plan 0.05 actq 0.07 jobs 0.00 CPU 0.51]
+    + stage 0.06) + commit/emit 0.37 + draft 1.59
+  per layer-window: CPU experts 0.10 (0.13 entries), VRAM hits 11.74, PCIe 0.01
+```
+
+That is the line that resolved this repository's decode investigation: `ms/token` is flat at
+**12.0–15.7 ms**, the CPU expert pool is **0.5–4%** of window time, and PCIe is **0.01 ms**. Without
+it, the numbers were being explained by inference and the inference was wrong.
+
+**Remove the drop-in when you are done measuring.** The engine's own documentation says to use the
+profiler to *compare*, not to measure speed — it costs rate. Leaving it on in production is a
+silent performance tax:
+
+```bash
+rm /etc/systemd/system/strata-v100.service.d/10-profiler.conf
+rmdir /etc/systemd/system/strata-v100.service.d
+systemctl daemon-reload && systemctl restart strata-v100
+```
 
 ### `--spec 4` beats `--spec 8`
 
@@ -114,10 +160,13 @@ the page cache — the engine's own help says so. `mmap` maps it into the page c
 it, so rows in use stay resident and the rest remains reclaimable.
 
 **This section previously published a three-arm table — `direct` 73.0/72.6, `ram` 75.8/98.8,
-`mmap` 74.1/100.0 — and that table is withdrawn.** The arms were measured at three different points
-in one service's lifetime, not interleaved. On this machine the drift between measurement windows
-is **2.35×** on the same configuration and prompt, which is larger than the effect the table
-claimed. Whatever ordering those arms have cannot be separated from when they happened to run.
+`mmap` 74.1/100.0 — and that table is withdrawn.** The arms were measured at three different
+points in one service's lifetime, not interleaved, and this repository's later work found the
+swing between measurement windows to be larger than the effect the table claimed. Whatever ordering
+those arms have cannot be separated from when they happened to run. (An earlier revision of this
+file put that swing at 2.35×; see [below](#correction-the-235-forward-variance-was-an-arithmetic-error)
+— the swing was real at the time of measurement but the figure was computed with the wrong
+denominator.)
 
 **What is still defensible, in order of confidence:**
 
@@ -148,43 +197,72 @@ grep -E "VmRSS|VmLck|VmSwap" /proc/$(pgrep -f "build/strata --serve" | head -1)/
 # mmap: VmLck 0 kB, VmSwap 0 kB   -- ram: VmLck ~26.8 GB
 ```
 
-### Measurement drift — the largest effect on this machine
+### Interleave your arms — and check the denominator before you believe a swing
 
-Recorded here because it dominates everything else in this file, and because it is the reason the
-tables in this document are weaker than they appear.
+Two separate corrections live here, and both cost a round of investigation. The rule that survives
+is short: **interleave the arms of any A/B inside one service lifetime (A, B, A, B), and report a
+median from a reproduction round.** Never run arm A to completion and then arm B.
 
-On one service, one configuration, one prompt, across one log:
+**Correction: the "2.35× forward variance" was an arithmetic error.**
 
-| Output length | runs | median | best |
-| --: | --: | --: | --: |
-| <10 tok | 231 | 59.0 | 114.2 |
-| 150–299 tok | 78 | 91.1 | 112.2 |
-| 512+ tok | 517 | 77.1 | **127.0** |
+An earlier revision of this section reported that the duration of a single forward varied **2.35×**
+and that this was the effect to watch. It was arrived at by normalising decode milliseconds by the
+engine's `drafts_offered` counter:
 
-The same 512-token request ran at segment means of **86–90 tok/s mid-lifetime and 70.8 at the end**.
-After a clean restart it settled at ~70.3 (twelve runs: `69.5 70.3 70.3 70.3 69.0 68.7 72.8 71.3
-65.7 73.7`).
-
-Normalising by the engine's own `drafts_offered` counter shows where it lives — **not** in draft
-acceptance:
-
-| decode ms | tok/s | accept rate | ms/forward |
+| decode ms | tok/s | accept rate | "ms/forward" |
 | --: | --: | --: | --: |
 | 6,127 | 83.6 | 82.2% | **75.4** |
 | 6,750 | 75.8 | 83.4% | 95.4 |
 | 7,337 | 69.8 | 83.7% | 129.3 |
 | 11,017 | 46.5 | 83.1% | **177.0** |
 
-Acceptance is flat at 82–83%, work per forward is flat, and **the duration of a single forward
-varies 2.35×**. Implemented as a caveat throughout this file: **any A/B on this machine must
-interleave its arms inside one service lifetime** (A, B, A, B), never run arm A to completion and
-then arm B.
+**`drafts_offered` counts verify *windows*, not forwards.** Deep acceptance means *fewer* windows,
+so dividing by it inflates the quotient and manufactures a slowdown that is not there. The correct
+per-token cost is flat: **12.0–15.7 ms** across seven profiled runs.
 
-Candidate causes, each tested and rejected:
+The engine will tell you this directly if you ask it. Set `STRATA_DECODE_TIMING=1` (0.1.40+, #610)
+and each request logs its own breakdown:
+
+```
+strata decode timing: 281 windows, avg T 2.04, 1.82 tokens/window, 25.80 ms/window
+  = verify 23.56 (GPU-reach wait 0.00 + per-layer host 0.00 [plan 0.05 actq 0.07 jobs 0.00 CPU 0.51]
+    + stage 0.06) + commit/emit 0.37 + draft 1.59
+  per layer-window: CPU experts 0.10 (0.13 entries), VRAM hits 11.74, PCIe 0.01
+```
+
+| tokens/window | ms/window | **ms/token** | CPU experts | VRAM hits |
+| --: | --: | --: | --: | --: |
+| 3.09 | 37.89 | **12.26** | 0.50 | 18.99 |
+| 2.79 | 33.49 | **12.00** | 0.41 | 17.08 |
+| 1.84 | 25.80 | **14.02** | 0.20 | 12.18 |
+| 1.50 | 23.58 | **15.72** | 0.12 | 9.41 |
+
+`ms/window` is **sub-linear** in tokens/window — ~23 ms fixed plus ~9 ms per accepted token — so
+throughput is set by *tokens per window*, which is a property of the content, not of the machine.
+The CPU expert pool is 0.5–4% of window time; PCIe is 0.01 ms. **Neither is a bottleneck, and there
+is no drift to explain.**
+
+**There is a second lesson in how long this took.** The 46–127 tok/s spread that started the
+investigation came from comparing runs of **different content and different length** across
+sessions. Twelve rounds of three content types, interleaved, in two separate runs:
+
+| Content | Round 1 (median) | Round 2 (median) | Acceptance |
+| --: | --: | --: | --: |
+| prose (zh) | **84.8** | **80.8** | 78.8% |
+| code | **82.8** | **79.3** | 83.0% |
+| prose (en) | **70.9** | **68.3** | 81.5% |
+
+Content-to-content spread is **1.2×**; the same content across rounds differs by ≤5%. Note the
+ordering — Chinese prose beat code, against the usual expectation — and note that acceptance rate
+does not predict tok/s. **Measure the rate for the load you actually serve rather than assuming
+which workload is fastest.**
+
+Hypotheses ruled out along the way (they were genuinely tested, and re-testing them is wasted
+effort, but they are no longer evidence of an unknown cause):
 
 | Hypothesis | Test | Result |
 | --- | --- | --- |
-| Chinese prompt is slower | EN/ZH interleaved, one process | 68.8 vs 67.7 — no |
+| Chinese prompt is slower | EN/ZH interleaved, one process | 68.8 vs 67.7 — no (and reversed in a later interleaved run) |
 | Draft acceptance collapses | engine counters, EN vs ZH | 78.1% vs 77.2% — no |
 | Expert cache degrades | log line, both languages | 99.8% vs 99.9% — no |
 | Conversation cache fills up | clean restart, slots empty | still 61–84 — no |
@@ -192,14 +270,14 @@ Candidate causes, each tested and rejected:
 | PLE table not resident | pre-warmed all 26.82 GiB | no change — no |
 | NUMA placement | `numactl --cpunodebind=0` | **worse** (49–69) — no |
 
-The last two deserve the emphasis because both are the intuitive fix and both failed.
-**`--pool-affinity` has no "one NUMA node" mode** — only `all` / `auto` / `p-cores` — so the
-obvious way to stop workers crossing QPI does not exist, and pinning the whole service to node 0
-was slower.
+The last one still carries a usable fact: **`--pool-affinity` has no "one NUMA node" mode** — only
+`all` / `auto` / `p-cores` — so there is no supported way to stop workers crossing QPI, and pinning
+the whole service to node 0 was slower.
 
-**Not identified.** Remaining candidates: QPI contention between the sockets (GPU0↔GPU1 is `SYS`,
-not P2P) and PCIe Gen 3 ×16 saturation. Both are consistent with what is measured; neither is
-isolated.
+**A related trap, from the report side:** this repository has carried decode figures from several
+eras with different protocols. Comparing an old arm's *maximum* against a new arm's *median* reads
+as a drop where there was a rise. Always state n, whether arms were interleaved, and whether the
+figure is a median or a raw value — next to the number.
 
 ### Kernel `vm.*` tuning — measured, and a loss here
 

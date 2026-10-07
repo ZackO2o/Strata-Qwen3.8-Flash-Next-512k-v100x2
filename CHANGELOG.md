@@ -1,5 +1,75 @@
 # Changelog
 
+## v1.3 — no drift to explain: ~80 tok/s was there all along
+
+v1.2 concluded that this machine's decode rate swings by 2.35× inside a single forward, that the
+engine's own counters could not see it, and that the cause was unidentified (leading candidates:
+QPI contention between sockets, PCIe Gen 3 ×16 saturation). **That conclusion was wrong, and this
+release withdraws it.**
+
+**What the engine actually said.** Strata 0.1.40 can profile its own decode loop — set
+`STRATA_DECODE_TIMING=1` (with `STRATA_VERIFY_PROFILE=1`, #610) and every request logs a per-window
+breakdown:
+
+```
+strata decode timing: 281 windows, avg T 2.04, 1.82 tokens/window, 25.80 ms/window
+  = verify 23.56 (GPU-reach wait 0.00 + per-layer host 0.00 [plan 0.05 actq 0.07 jobs 0.00 CPU 0.51]
+    + stage 0.06) + commit/emit 0.37 + draft 1.59
+  per layer-window: CPU experts 0.10 (0.13 entries), VRAM hits 11.74, PCIe 0.01
+```
+
+Across seven profiled runs:
+
+| tokens/window | ms/window | **ms/token** | CPU experts | VRAM hits |
+| --: | --: | --: | --: | --: |
+| 3.09 | 37.89 | **12.26** | 0.50 | 18.99 |
+| 2.79 | 33.49 | **12.00** | 0.41 | 17.08 |
+| 2.66 | 33.65 | **12.65** | 0.49 | 16.73 |
+| 1.84 | 25.80 | **14.02** | 0.20 | 12.18 |
+| 1.59 | 24.06 | **15.13** | 0.22 | 9.86 |
+| 1.50 | 23.58 | **15.72** | 0.12 | 9.41 |
+
+**Where the 2.35× came from.** v1.2 normalised decode milliseconds by the engine's `drafts_offered`
+counter and called the result "ms/forward":
+
+| decode ms | tok/s | accept rate | "ms/forward" |
+| --: | --: | --: | --: |
+| 6,127 | 83.6 | 82.2% | 75.4 |
+| 11,017 | 46.5 | 83.1% | **177.0** |
+
+**`drafts_offered` counts verify *windows*, not forwards.** Deeper acceptance produces *fewer*
+windows, so the quotient inflates as acceptance improves — a slowdown manufactured by the
+denominator. `ms/token` (`ms/window ÷ tokens_per_window`) is flat at **12.0–15.7 ms**, and
+`ms/window` is sub-linear in tokens/window (~23 ms fixed plus ~9 ms per accepted token).
+
+**What actually moves the number: content.** Twelve rounds × three content types, interleaved,
+first two dropped, run twice:
+
+| Content | Round 1 (median) | Round 2 (median) | Acceptance |
+| --: | --: | --: | --: |
+| prose (zh) | **84.8** | **80.8** | 78.8% |
+| code | **82.8** | **79.3** | 83.0% |
+| prose (en) | **70.9** | **68.3** | 81.5% |
+
+Content-to-content spread is **1.2×**; the same content across rounds differs ≤5% and the ordering
+reproduced. Acceptance rate does *not* predict tok/s — the lowest-acceptance arm was fastest. Note
+that the ordering is not the intuitive one (Chinese prose beat code), which is precisely why the
+rate should be measured for the load you serve rather than assumed.
+
+**Headline corrected to `~80 tok/s`**, from "65–105, expect ~70 from a cold start". The lower
+figures in v1.2's band were real measurements of runs that were not comparable to each other.
+
+**Nothing else in the recipe changes.** The bottlenecks that were measured and rejected — language,
+draft acceptance, expert cache, conversation-cache fill, GPU throttling, PLE residency, NUMA
+placement — remain settled and are still worth not re-testing. `--ple-io mmap` remains the
+recommended arm for the reasons in v1.1 (it is structural: `ram` locks 26.8 GiB and drives the
+kernel into reclaiming the process's own pages), still with **no percentage quoted**.
+
+**And a reporting rule, since it cost a round here.** This repository has carried decode figures
+from several eras under different protocols. Comparing an old arm's maximum against a new arm's
+median reads as a drop where there was a rise. State n, whether the arms were interleaved, and
+whether the figure is a median or a raw value — beside the number.
+
 ## v1.2 — the decode numbers were a window, not a property
 
 v1.1 published **74.1 tok/s prose / 100.0 tok/s code** and attributed the code figure to

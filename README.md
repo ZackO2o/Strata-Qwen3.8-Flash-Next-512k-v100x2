@@ -1,8 +1,7 @@
 # Strata-Qwen3.8-Flash-Next-512k-v100x2
 
 **A 125B mixture-of-experts model, uncensored, 512K tokens of context and image input, served
-from two six-year-old Tesla V100 32G cards — at 65–105 tok/s decode on 512-token outputs
-(expect ~70 from a cold start).**
+from two six-year-old Tesla V100 32G cards — at ~80 tok/s decode on 512-token outputs.**
 
 Two Tesla V100-PCIE-32G (Volta, sm_70), cards NVIDIA no longer supports in the engine's
 prebuilt binaries. [Strata](https://github.com/Niko1221/Strata) is a CPU+GPU hybrid MoE engine
@@ -15,7 +14,7 @@ took: the build, the memory arithmetic, the tuning, the measurements, and the de
   ~6B active), 78.5 GiB in two shards, served through the OpenAI-compatible API
 - Context: **524,288 tokens** a request (YaRN 2× extrapolation over the model's native 262,144)
 - Vision: yes, the model's own encoder, run on the GPU
-- Decode: **65–105 tok/s** on 512-token outputs; ~70 from a cold start — see [below](#decode-is-a-band-not-a-number)
+- Decode: **~80 tok/s** on 512-token outputs, ~1.2× either way with content — see [below](#decode-80-toks-and-the-spread-was-ours-not-the-machines)
 - Prefill: **1,684.1 tok/s** at ~16K cold; 1,082.3 tok/s at ~4K, where fixed cost still bites
 - Retrieval: correct at 8K, 30K, 121K and **241K tokens**
 - Prompt reuse: **82× faster** on a repeat, and the cache survives a restart
@@ -110,50 +109,90 @@ decoding are separated rather than blended into one wall-clock number. `tools/be
 reading; the method is described at the top of that file and the reasons it matters are in
 [What we did not measure](#what-we-did-not-measure).
 
-### Decode is a band, not a number
+### Decode: ~80 tok/s, and the spread was ours, not the machine's
 
-**512-token outputs decode at 65–105 tok/s on this machine, and ~70 is what a cold start gives
-you.** That is the honest summary, and it took a correction to get to it — the figures this section
-first published were 74.1 / 100.0, measured in a favourable window and not reproducible later on
-the same configuration.
+**512-token outputs decode at a stable ~80 tok/s on this machine.** The number moves a little with
+*what* you ask for — not with how long the service has been up. This took two corrections to get
+right; both are recorded below because each is an easy trap.
 
-The evidence, from the engine's own log on one service with one configuration and one prompt:
+**What actually drives tok/s: tokens per verify window.** The engine can profile itself — set
+`STRATA_DECODE_TIMING=1` (0.1.40+, #610) and every request logs a breakdown:
 
-| Output length | runs | median | best |
+```
+strata decode timing: 281 windows, avg T 2.04, 1.82 tokens/window, 25.80 ms/window
+  = verify 23.56 (GPU-reach wait 0.00 + per-layer host 0.00 [plan 0.05 actq 0.07 jobs 0.00 CPU 0.51]
+    + stage 0.06) + commit/emit 0.37 + draft 1.59
+  per layer-window: CPU experts 0.10 (0.13 entries), VRAM hits 11.74, PCIe 0.01
+```
+
+Across seven profiled runs:
+
+| tokens/window | ms/window | **ms/token** | CPU experts | VRAM hits |
+| --: | --: | --: | --: | --: |
+| 3.09 | 37.89 | **12.26** | 0.50 | 18.99 |
+| 2.79 | 33.49 | **12.00** | 0.41 | 17.08 |
+| 2.55 | 33.19 | **13.02** | 0.35 | 16.46 |
+| 1.84 | 25.80 | **14.02** | 0.20 | 12.18 |
+| 1.59 | 24.06 | **15.13** | 0.22 | 9.86 |
+| 1.50 | 23.58 | **15.72** | 0.12 | 9.41 |
+
+**ms/token is flat (12.0–15.7, 1.31×) and ms/window is *sub-linear* in tokens/window** — a window
+costs ~23 ms fixed plus ~9 ms for each token it accepts. So throughput is governed almost entirely
+by *tokens per window*, which is a property of the content (how many draft tokens the verifier
+accepts), not of the machine. The CPU expert pool is 0.5–4% of window time and PCIe is 0.01 ms:
+**neither is a bottleneck.**
+
+**Three content types, twelve rounds each, interleaved, first two dropped:**
+
+| Content | Round 1 (median) | Round 2 (median) | Acceptance |
 | --: | --: | --: | --: |
-| <10 tok | 231 | 59.0 | 114.2 |
-| 50–149 tok | 23 | 85.3 | 112.2 |
-| 150–299 tok | 78 | 91.1 | 112.2 |
-| 512+ tok | 517 | 77.1 | **127.0** |
+| prose (zh) | **84.8** | **80.8** | 78.8% |
+| code | **82.8** | **79.3** | 83.0% |
+| prose (en) | **70.9** | **68.3** | 81.5% |
 
-Across one service lifetime the *same* 512-token request ran at segment means of **86–90 tok/s in
-the middle and 70.8 at the end**. After a clean restart, twelve runs gave
-`69.5 70.3 70.3 70.3 69.0 68.7 72.8 71.3 65.7 73.7` — median ~70.3.
+The spread between content types is **1.2×**, the ordering reproduced across both rounds, and
+same-content medians differ by ≤5% between rounds. Note that acceptance rate does *not* predict
+tok/s — the lowest-acceptance arm is the fastest. This also means **"code is fastest" is not
+something to assume**: here Chinese prose beat code, and the ordering is not stable enough to plan
+capacity around. Measure it.
 
-**The variance is inside a single forward, not in the draft acceptance.** Normalising eight
-requests by the engine's own `drafts_offered` counter:
+#### Correction 1 (v1.2): the published figures were a window, not a property
 
-| decode ms | tok/s | accept rate | ms/forward |
+The first version of this section published 74.1 / 100.0. They were measured at one point in a
+service lifetime without interleaving the arms, and did not survive a re-run. **Any A/B on this
+machine must interleave its arms** — run A, B, A, B rather than A to completion then B.
+
+#### Correction 2 (v1.3): the "2.35× forward variance" was an arithmetic error
+
+v1.2 went further and reported that the *length of a single forward varied 2.35×*, that this was
+the thing to watch, and that its cause was unidentified (candidates: QPI contention, PCIe Gen 3
+saturation). **That was wrong, and the profiler above is what disproved it.**
+
+v1.2 normalised by the engine's `drafts_offered` counter and called the result "ms/forward":
+
+| decode ms | tok/s | accept rate | "ms/forward" |
 | --: | --: | --: | --: |
-| 6,127 | 83.6 | 82.2% | **75.4** |
-| 6,750 | 75.8 | 83.4% | 95.4 |
-| 7,337 | 69.8 | 83.7% | 129.3 |
+| 6,127 | 83.6 | 82.2% | 75.4 |
 | 11,017 | 46.5 | 83.1% | **177.0** |
 
-Acceptance is flat at 82–83% throughout; work per forward is flat; **the length of a forward
-varies 2.35×**. That is what you are watching when the tok/s number moves. The engine reports
-`hit_rate 0.999` and `pcie_share 0.0` the whole time, so its own counters do not flag it.
+**`drafts_offered` is a count of verify *windows*, not of forwards.** Dividing by it conflates the
+number of windows with the cost of one. Deep acceptance means *fewer* windows, so the quotient
+inflates and looks like a slowdown. The real per-token cost was flat all along — 12.0–15.7 ms, not
+2.35×. **The correct metric is `ms/window ÷ tokens_per_window`.**
 
-Seven candidate explanations were tested and rejected — language, draft acceptance, expert cache,
-conversation-cache fill, GPU throttling, PLE residency, and NUMA placement. **The cause is not yet
-identified**, and [docs/TUNING.md](docs/TUNING.md) records the full list with the test that
-rejected each. The remaining candidates are QPI contention between the two sockets and PCIe Gen 3
-×16 saturation, neither of which has been isolated.
+So the "seven rejected hypotheses" list was not evidence of an unknown cause; it was evidence that
+there was no anomaly to explain. The 46–127 tok/s spread that started this whole investigation came
+from comparing runs of **different content and different length** across sessions, and the rest
+from the bad denominator. Seven candidates are still worth not re-testing (language, draft
+acceptance, expert cache, conversation-cache fill, GPU throttling, PLE residency, NUMA placement)
+but the conclusion to carry is simpler: **on this machine, for a fixed prompt, decode does not
+degrade over a service lifetime.** If you see a 2× swing, check whether you ran the same task, and
+check your denominator, before suspecting the hardware.
 
-**What this means for benchmarking here.** Any A/B on this machine must **interleave its arms
-within one service lifetime** — run A, B, A, B rather than A to completion then B. Every table in
-this repository predating v1.2 does not do that, including the sweep results, and should be read
-with that caveat. A single-run comparison cannot clear the spread.
+**What this means for benchmarking here.** Interleave arms within one service lifetime, report a
+median with a reproduction round, and state the protocol next to the number — this repository
+contains figures from several eras, and mixing an old maximum against a new median will show you a
+drop where there was a rise.
 
 ### Concurrency
 
@@ -492,12 +531,13 @@ Stated plainly so nobody cites this as more than it is:
   multi-day soak.
 - **Anything about a third card.** Untested here.
 
-## Four ways this document was wrong before it was right
+## Five ways this document was wrong before it was right
 
-All four errors were ours, all four produced confident and plausible numbers, and they are why the
+All five errors were ours, all five produced confident and plausible numbers, and they are why the
 benchmark reads the engine's counters instead of a stopwatch, why every concurrency figure now runs
-to a full long output, and why A/B arms must be interleaved. Recording them because a reader
-deserves to know which figures were once overstated.
+to a full long output, why A/B arms must be interleaved, and why a swing is checked for a bad
+denominator before it is explained by hardware. Recording them because a reader deserves to know
+which figures were once overstated.
 
 1. **Prefill measured from client wall-clock, with cache hits mixed in.** The first version timed
    the HTTP call and divided by the prompt length. On a 32K prompt that had been partly cached it
@@ -520,20 +560,35 @@ deserves to know which figures were once overstated.
    describes. A concurrency test has to make every request run long enough to actually be in the
    queue at the same time; short replies measure the client's thread pool, not the server.
 
-4. **A decode figure published from a favourable window, then compared against other windows.**
-   The 74.1 / 100.0 headline came from a run that measured well on the day. Weeks later the same
-   configuration, same prompt, measured ~70 — and the swing turned out to be larger than every
-   tuning effect in this repository (see
-   [Decode is a band](#decode-is-a-band-not-a-number)). Worse, the three `--ple-io` arms and the
-   ten-setting sweep were each measured in their own window rather than interleaved, so their
-   orderings cannot be trusted even where their conclusions survive. **The rule this bought: an
-   A/B must interleave its arms inside one service lifetime.** Any comparison in this repository
-   whose arms ran to completion one after another is weaker than it looks, and that includes
-   tables published before v1.2.
+4. **A decode figure published from a favourable window.** The 74.1 / 100.0 headline came from a
+   run that measured well on the day. Weeks later the same configuration, same prompt, measured
+   ~70 — and the difference was larger than every tuning effect in this repository. Worse, the
+   three `--ple-io` arms and the ten-setting sweep were each measured in their own window rather
+   than interleaved, so their orderings cannot be trusted even where their conclusions survive.
+   **The rule this bought: an A/B must interleave its arms inside one service lifetime.** Any
+   comparison in this repository whose arms ran to completion one after another is weaker than it
+   looks, and that includes tables published before v1.2.
+
+5. **A 2.35× anomaly that was an arithmetic error.** Having concluded the decode rate swung with
+   the measurement window, we went looking for the mechanism — and found one, in the engine's own
+   counters: normalising decode time by `drafts_offered` made the cost of a single forward appear
+   to vary 2.35×. Seven hypotheses were tested and rejected; the write-up said the cause was
+   unidentified, with QPI contention and PCIe saturation as the leading candidates. **All of that
+   was wrong.** `drafts_offered` counts verify *windows*, not forwards, so dividing by it mixes the
+   number of windows into the cost of one — and deeper acceptance means fewer windows, which
+   inflates the quotient and invents a slowdown. Setting `STRATA_DECODE_TIMING=1` and reading the
+   engine's own per-window breakdown shows the real per-token cost is flat at 12.0–15.7 ms.
+   The "anomaly" was a denominator with the wrong units, and the spread that started the whole
+   investigation was mostly runs of different content and different length being compared.
+   **The rule this bought: before theorising about a performance anomaly, confirm the metric
+   measures what its name says.** A rejected-hypothesis table is not evidence of a hidden cause —
+   it can be evidence that there was no anomaly.
 
 If you re-run this benchmark on your own pair and get an IQR of 0.0, you have hit the second bug,
 not a perfectly stable machine. If you get a clean 3% difference between two settings, you have
-probably hit the fourth — re-run it interleaved before believing it.
+probably hit the fourth — re-run it interleaved before believing it. If you find a quantity that
+swings by a factor, check what its denominator counts before you go looking for the hardware to
+blame.
 
 ## The two things that cost us the most
 
